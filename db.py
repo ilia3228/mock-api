@@ -1,0 +1,215 @@
+"""SQLite persistence for the mock API.
+
+Tables
+------
+- users(id, email, name, pw_hash, pw_salt, created_at)
+- tokens(token, user_id, created_at)
+- jobs(id, user_id, filename, size, lang, status, phase, progress,
+       result_json, error, created_at, updated_at)
+
+The DB file lives at ``mock-api/data.db`` and is treated as throwaway.
+Delete it to reset all state.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import time
+from pathlib import Path
+from typing import Any
+
+DB_PATH = Path(__file__).parent / "data.db"
+_LOCK = threading.RLock()
+_CONN: sqlite3.Connection | None = None
+
+
+def _conn() -> sqlite3.Connection:
+    global _CONN
+    if _CONN is None:
+        _CONN = sqlite3.connect(DB_PATH, check_same_thread=False, isolation_level=None)
+        _CONN.row_factory = sqlite3.Row
+        _CONN.execute("PRAGMA journal_mode=WAL")
+        _CONN.execute("PRAGMA foreign_keys=ON")
+    return _CONN
+
+
+def init() -> None:
+    with _LOCK:
+        c = _conn()
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                email       TEXT UNIQUE NOT NULL,
+                name        TEXT NOT NULL DEFAULT '',
+                pw_hash     TEXT NOT NULL,
+                pw_salt     TEXT NOT NULL,
+                created_at  REAL NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS tokens (
+                token       TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at  REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS tokens_user_idx ON tokens(user_id);
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id          TEXT PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                filename    TEXT NOT NULL,
+                size        INTEGER NOT NULL DEFAULT 0,
+                lang        TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                phase       TEXT NOT NULL DEFAULT 'detect',
+                progress    REAL NOT NULL DEFAULT 0,
+                result_json TEXT,
+                error       TEXT,
+                created_at  REAL NOT NULL,
+                updated_at  REAL NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS jobs_user_idx ON jobs(user_id, created_at DESC);
+            """
+        )
+        # Any job left in `queued` or `running` from a previous process must
+        # have been orphaned by a crash/restart — the live asyncio task that
+        # owned it is gone and can never resume. Mark them as errored so the
+        # frontend doesn't get stuck on the analysing view forever.
+        now = time.time()
+        c.execute(
+            "UPDATE jobs"
+            " SET status = 'error', error = COALESCE(error, ?), updated_at = ?"
+            " WHERE status IN ('queued', 'running')",
+            ("server restarted before job completed", now),
+        )
+
+
+# ─── users ──────────────────────────────────────────────────────────────────
+
+def insert_user(email: str, name: str, pw_hash: str, pw_salt: str) -> dict[str, Any]:
+    with _LOCK:
+        c = _conn()
+        try:
+            cur = c.execute(
+                "INSERT INTO users(email,name,pw_hash,pw_salt,created_at) VALUES(?,?,?,?,?)",
+                (email, name, pw_hash, pw_salt, time.time()),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("email already registered") from exc
+        return user_by_id(cur.lastrowid)  # type: ignore[arg-type]
+
+
+def user_by_email(email: str) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _conn().execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+        return dict(row) if row else None
+
+
+def user_by_id(user_id: int) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _conn().execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        return dict(row) if row else None
+
+
+# ─── tokens ─────────────────────────────────────────────────────────────────
+
+def insert_token(token: str, user_id: int) -> None:
+    with _LOCK:
+        _conn().execute(
+            "INSERT INTO tokens(token,user_id,created_at) VALUES(?,?,?)",
+            (token, user_id, time.time()),
+        )
+
+
+def user_by_token(token: str) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _conn().execute(
+            "SELECT u.* FROM users u JOIN tokens t ON t.user_id = u.id WHERE t.token = ?",
+            (token,),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def delete_token(token: str) -> None:
+    with _LOCK:
+        _conn().execute("DELETE FROM tokens WHERE token = ?", (token,))
+
+
+# ─── jobs ───────────────────────────────────────────────────────────────────
+
+def insert_job(
+    job_id: str, user_id: int, filename: str, size: int, lang: str, status: str
+) -> None:
+    now = time.time()
+    with _LOCK:
+        _conn().execute(
+            "INSERT INTO jobs(id,user_id,filename,size,lang,status,phase,progress,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (job_id, user_id, filename, size, lang, status, "detect", 0.0, now, now),
+        )
+
+
+def update_job(
+    job_id: str,
+    *,
+    status: str | None = None,
+    phase: str | None = None,
+    progress: float | None = None,
+    result: dict | None = None,
+    error: str | None = None,
+) -> None:
+    fields: list[str] = []
+    values: list[Any] = []
+    if status is not None:
+        fields.append("status = ?"); values.append(status)
+    if phase is not None:
+        fields.append("phase = ?"); values.append(phase)
+    if progress is not None:
+        fields.append("progress = ?"); values.append(progress)
+    if result is not None:
+        fields.append("result_json = ?"); values.append(json.dumps(result, ensure_ascii=False))
+    if error is not None:
+        fields.append("error = ?"); values.append(error)
+    if not fields:
+        return
+    fields.append("updated_at = ?"); values.append(time.time())
+    values.append(job_id)
+    with _LOCK:
+        _conn().execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id = ?", values)
+
+
+def get_job(job_id: str) -> dict[str, Any] | None:
+    with _LOCK:
+        row = _conn().execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        data["result"] = json.loads(data.pop("result_json")) if data.get("result_json") else None
+        return data
+
+
+def delete_job(job_id: str, user_id: int) -> bool:
+    """Remove a job row. Returns True if a row owned by `user_id` was deleted."""
+    with _LOCK:
+        cur = _conn().execute(
+            "DELETE FROM jobs WHERE id = ? AND user_id = ?",
+            (job_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def jobs_for_user(user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    with _LOCK:
+        rows = _conn().execute(
+            "SELECT id,filename,size,lang,status,result_json,created_at"
+            " FROM jobs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["result"] = json.loads(d.pop("result_json")) if d.get("result_json") else None
+        out.append(d)
+    return out
