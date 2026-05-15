@@ -4,7 +4,7 @@ HTTP API for `deobfuscator-app`. Dispatches uploaded files to one of two
 real deobfuscators based on filename detection:
 
 - **jsdeobf** — `.js` files → `node dist/main.js` from
-  `../js-python-deobfuscator`.
+  `../js-deobfuscator`.
 - **pydeobf** — `.py` / `.pyc` files → `python src/main.py` from
   `../python-deobfuscator`.
 
@@ -77,7 +77,7 @@ before the first analyze call.
 
 ```bash
 # JS — build dist/ once; subsequent runs reuse the build.
-cd ../js-python-deobfuscator
+cd ../js-deobfuscator
 npm install
 npm run build
 
@@ -85,7 +85,7 @@ npm run build
 pip install rich
 ```
 
-By default the API looks for the backends at `../js-python-deobfuscator`
+By default the API looks for the backends at `../js-deobfuscator`
 and `../python-deobfuscator` (relative to `mock-api/`). Override with the
 `JS_DEOBF_DIR` / `PY_DEOBF_DIR` environment variables if they live
 somewhere else.

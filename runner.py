@@ -7,7 +7,7 @@ run directory once the process exits.
 
 The two backend CLIs live in sibling repositories:
 
-    JS_DEOBF_DIR  -> ../js-python-deobfuscator   (node dist/main.js)
+    JS_DEOBF_DIR  -> ../js-deobfuscator          (node dist/main.js)
     PY_DEOBF_DIR  -> ../python-deobfuscator      (python src/main.py)
 
 Both can be overridden with environment variables of the same name.
@@ -253,16 +253,21 @@ def _js_repo_dir() -> Path:
     env = os.environ.get("JS_DEOBF_DIR")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parent.parent / "js-python-deobfuscator"
+    return Path(__file__).resolve().parent.parent / "js-deobfuscator"
 
 
 async def run_js(
     *,
     input_path: Path,
     run_dir: Path,
-    use_llm: bool,
-    dynamic_eval: bool,
-    auto_ioc: bool,
+    llm_mode: str = "off",
+    dynamic_eval: bool = True,
+    auto_ioc: bool = True,
+    static_analysis: bool = True,
+    rename: bool = True,
+    max_layers: int | None = None,
+    timeout: int | None = None,
+    verbose: bool = True,
     on_log: LogCb,
     on_phase: PhaseCb,
     cancel_event: asyncio.Event,
@@ -279,18 +284,32 @@ async def run_js(
             f"run `npm install && npm run build` in {repo_dir}"
         )
 
-    args = [
+    args: list[str] = [
         "node", str(main_js), str(input_path),
         "--output-dir", str(run_dir),
         "--no-isolate-runs",
-        "-v",
     ]
-    if use_llm:
+    args.append("-v" if verbose else "-q")
+    # JS backend exposes ‘use-llm’ (both), ‘use-llm-rename’, ‘use-llm-format’
+    # as positive flags. ``llm_mode='off'`` means: pass none of them.
+    if llm_mode == "both":
         args.append("--use-llm")
+    elif llm_mode == "rename":
+        args.append("--use-llm-rename")
+    elif llm_mode == "format":
+        args.append("--use-llm-format")
     if not dynamic_eval:
         args.append("--no-dynamic")
     if not auto_ioc:
         args.append("--no-ioc")
+    if not static_analysis:
+        args.append("--no-static")
+    if not rename:
+        args.append("--no-rename")
+    if max_layers is not None and max_layers > 0:
+        args += ["--max-layers", str(int(max_layers))]
+    if timeout is not None and timeout > 0:
+        args += ["--timeout", str(int(timeout))]
 
     process_log.info(
         "backend_start %s",
@@ -298,9 +317,14 @@ async def run_js(
             engine="jsdeobf",
             input=str(input_path),
             output_dir=str(run_dir),
-            use_llm=use_llm,
+            llm_mode=llm_mode,
             dynamic_eval=dynamic_eval,
             auto_ioc=auto_ioc,
+            static_analysis=static_analysis,
+            rename=rename,
+            max_layers=max_layers,
+            timeout=timeout,
+            verbose=verbose,
             cwd=str(repo_dir),
         ),
     )
@@ -462,9 +486,14 @@ async def run_py(
     *,
     input_path: Path,
     run_dir: Path,
-    use_llm: bool,
-    dynamic_eval: bool,
-    auto_ioc: bool,
+    llm_mode: str = "off",
+    dynamic_eval: bool = True,
+    auto_ioc: bool = True,
+    static_analysis: bool = True,
+    rename: bool = True,
+    max_layers: int | None = None,
+    timeout: int | None = None,
+    verbose: bool = True,
     on_log: LogCb,
     on_phase: PhaseCb,
     cancel_event: asyncio.Event,
@@ -481,17 +510,30 @@ async def run_py(
             f"check PY_DEOBF_DIR env or that {repo_dir} exists"
         )
 
-    args = [
+    args: list[str] = [
         sys.executable, str(main_py), str(input_path),
         "--output-dir", str(run_dir),
-        "-v",
     ]
-    if use_llm:
+    args.append("-v" if verbose else "-q")
+    # PY backend uses ‘--use-llm’ (both), ‘--llm-rename’, ‘--llm-format’.
+    if llm_mode == "both":
         args.append("--use-llm")
+    elif llm_mode == "rename":
+        args.append("--llm-rename")
+    elif llm_mode == "format":
+        args.append("--llm-format")
     if not dynamic_eval:
         args.append("--no-dynamic")
     if not auto_ioc:
         args.append("--no-ioc")
+    if not static_analysis:
+        args.append("--no-static")
+    if not rename:
+        args.append("--no-rename")
+    if max_layers is not None and max_layers > 0:
+        args += ["--max-layers", str(int(max_layers))]
+    if timeout is not None and timeout > 0:
+        args += ["--timeout", str(int(timeout))]
 
     process_log.info(
         "backend_start %s",
@@ -499,9 +541,14 @@ async def run_py(
             engine="pydeobf",
             input=str(input_path),
             output_dir=str(run_dir),
-            use_llm=use_llm,
+            llm_mode=llm_mode,
             dynamic_eval=dynamic_eval,
             auto_ioc=auto_ioc,
+            static_analysis=static_analysis,
+            rename=rename,
+            max_layers=max_layers,
+            timeout=timeout,
+            verbose=verbose,
             cwd=str(repo_dir),
         ),
     )

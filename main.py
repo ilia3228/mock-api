@@ -20,6 +20,7 @@ import asyncio
 import ctypes
 import difflib
 import hashlib
+import io
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ import sys
 import threading
 import time
 import uuid
+import zipfile
 
 # ─── Windows: force Proactor event loop ─────────────────────────────────────
 # `asyncio.create_subprocess_exec` (used by runner.py to spawn the JS and
@@ -119,6 +121,7 @@ from pydantic import BaseModel, Field
 
 import auth
 import db
+import llm_config as llmcfg
 import runner
 import sample_data as sd
 from logging_config import configure_logging, get_logger, kv
@@ -146,6 +149,9 @@ class LogLine:
         return {"t": self.t, "level": self.level, "indent": self.indent, "text": self.text}
 
 
+VALID_LLM_MODES = ("off", "rename", "format", "both")
+
+
 @dataclass
 class Job:
     id: str
@@ -153,10 +159,16 @@ class Job:
     filename: str
     size: int
     lang: str
-    use_llm: bool
-    dynamic_eval: bool
-    auto_ioc: bool
-    speed: str
+    # Per-run options. ``llm_mode`` supersedes the legacy boolean ``use_llm``.
+    llm_mode: str = "off"
+    dynamic_eval: bool = True
+    auto_ioc: bool = True
+    static_analysis: bool = True
+    rename: bool = True
+    max_layers: int | None = None
+    timeout: int | None = None
+    verbose: bool = True
+    speed: str = "normal"
     status: JobStatus = "queued"
     phase: str = "detect"
     progress: float = 0.0
@@ -167,6 +179,27 @@ class Job:
     input_path: str | None = None
     _event: asyncio.Event | None = None
     _cancel: asyncio.Event | None = None
+
+    @property
+    def use_llm(self) -> bool:  # legacy alias used by older logs/snapshots
+        return self.llm_mode != "off"
+
+    def options_dict(self) -> dict[str, Any]:
+        """Per-run options snapshot. Serialised into ``jobs.options_json``
+        and copied into ``result.stats.options`` so the frontend can offer
+        “retry with same options” after a failure.
+        """
+        return {
+            "llm_mode":        self.llm_mode,
+            "dynamic_eval":    self.dynamic_eval,
+            "auto_ioc":        self.auto_ioc,
+            "static_analysis": self.static_analysis,
+            "rename":          self.rename,
+            "max_layers":      self.max_layers,
+            "timeout":         self.timeout,
+            "verbose":         self.verbose,
+            "speed":           self.speed,
+        }
 
 
 JOBS: dict[str, Job] = {}
@@ -264,9 +297,13 @@ async def run_job(job: Job) -> None:
             lang=job.lang,
             filename=job.filename,
             size=job.size,
-            use_llm=job.use_llm,
+            llm_mode=job.llm_mode,
             dynamic_eval=job.dynamic_eval,
             auto_ioc=job.auto_ioc,
+            static_analysis=job.static_analysis,
+            rename=job.rename,
+            max_layers=job.max_layers,
+            timeout=job.timeout,
             run_dir=str(out_dir),
         ),
     )
@@ -295,19 +332,23 @@ async def run_job(job: Job) -> None:
             kv(job_id=job.id, phase=job.phase, progress=round(job.progress, 3)),
         )
 
+    runner_kwargs = dict(
+        input_path=input_path, run_dir=out_dir,
+        llm_mode=job.llm_mode,
+        dynamic_eval=job.dynamic_eval,
+        auto_ioc=job.auto_ioc,
+        static_analysis=job.static_analysis,
+        rename=job.rename,
+        max_layers=job.max_layers,
+        timeout=job.timeout,
+        verbose=job.verbose,
+        on_log=on_log, on_phase=on_phase, cancel_event=job._cancel,
+    )
     try:
         if job.lang == "js":
-            rr = await runner.run_js(
-                input_path=input_path, run_dir=out_dir, use_llm=job.use_llm,
-                dynamic_eval=job.dynamic_eval, auto_ioc=job.auto_ioc,
-                on_log=on_log, on_phase=on_phase, cancel_event=job._cancel,
-            )
+            rr = await runner.run_js(**runner_kwargs)
         else:
-            rr = await runner.run_py(
-                input_path=input_path, run_dir=out_dir, use_llm=job.use_llm,
-                dynamic_eval=job.dynamic_eval, auto_ioc=job.auto_ioc,
-                on_log=on_log, on_phase=on_phase, cancel_event=job._cancel,
-            )
+            rr = await runner.run_py(**runner_kwargs)
         iocs = rr.iocs if job.auto_ioc else []
 
         if job._cancel.is_set():
@@ -339,9 +380,11 @@ async def run_job(job: Job) -> None:
                 "output_bytes": len(rr.clean_code.encode("utf-8")),
                 "duration_ms":  duration_ms,
                 "layers":       len(rr.layer_cards),
-                "llm_used":     job.use_llm,
+                "llm_mode":     job.llm_mode,
+                "llm_used":     job.use_llm,  # legacy alias
                 "dynamic_eval": job.dynamic_eval,
                 "auto_ioc":     job.auto_ioc,
+                "options":      job.options_dict(),
             },
             "layer_cards":   rr.layer_cards,
             "iocs":          iocs,
@@ -572,14 +615,331 @@ def me(user: dict = Depends(auth.current_user)) -> dict:
     return _public_user(user)
 
 
+class ChangePasswordBody(BaseModel):
+    current_password: str = Field(..., min_length=1, max_length=200)
+    new_password:     str = Field(..., min_length=6, max_length=200)
+
+
+@app.post("/api/auth/change-password")
+def change_password(
+    body: ChangePasswordBody,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Replace the user's password. Reuses the PBKDF2 hashing in ``auth``.
+
+    Existing tokens stay valid intentionally — the user just confirmed
+    knowledge of the current password and we don't want to log them out
+    of their own session as a side-effect.
+    """
+    if not auth.verify_password(
+        body.current_password, user["pw_hash"], user["pw_salt"]
+    ):
+        raise HTTPException(401, "current password incorrect")
+    pw_hash, pw_salt = auth.hash_password(body.new_password)
+    db.update_user_password(user["id"], pw_hash, pw_salt)
+    log.info(
+        "auth_password_changed %s",
+        kv(user_id=user["id"], email=user["email"]),
+    )
+    return {"ok": True}
+
+
+@app.delete("/api/auth/tokens")
+def auth_delete_tokens(
+    authorization: str | None = Header(default=None),
+    token: str | None = Query(default=None),
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Sign-out from every device *except* the caller's own session."""
+    own_token: str | None = None
+    if authorization and authorization.lower().startswith("bearer "):
+        own_token = authorization[7:].strip() or None
+    elif token:
+        own_token = token.strip() or None
+    revoked = db.delete_user_tokens(user["id"], except_token=own_token)
+    log.info(
+        "auth_tokens_revoked %s",
+        kv(user_id=user["id"], revoked=revoked, kept_own=bool(own_token)),
+    )
+    return {"ok": True, "revoked": revoked}
+
+
+class DeleteAccountBody(BaseModel):
+    email_confirm: str = Field(..., max_length=200)
+
+
+@app.delete("/api/auth/me")
+def delete_me(
+    body: DeleteAccountBody,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Delete the user account and every owned job/token cascade.
+
+    Requires the caller to retype their own email as a confirmation step
+    (matches the deletion flow in Settings → Account).
+    """
+    confirm = (body.email_confirm or "").strip().lower()
+    if confirm != (user["email"] or "").lower():
+        raise HTTPException(400, "email confirmation does not match")
+
+    # Cancel any in-flight jobs for this user before tearing down the row;
+    # otherwise a still-running coroutine could later UPDATE a vanished
+    # jobs row and resurrect it via SQLite's auto-vacuum semantics.
+    in_flight = [j for j in JOBS.values() if j.user_id == user["id"]]
+    for job in in_flight:
+        if job._cancel is not None and job.status in ("queued", "running"):
+            job._cancel.set()
+        JOBS.pop(job.id, None)
+
+    # Wipe each per-job directory before we lose the id list.
+    for job_id in db.all_job_ids_for_user(user["id"]):
+        work_dir = RUNS_DIR / job_id
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+    db.delete_user(user["id"])  # CASCADE clears tokens + jobs
+    log.warning(
+        "auth_account_deleted %s",
+        kv(user_id=user["id"], email=user["email"], in_flight=len(in_flight)),
+    )
+    return {"ok": True}
+
+
+# ─── LLM configuration ──────────────────────────────────────────────────────
+
+class LLMConfigBody(BaseModel):
+    """Payload for ``PUT /api/llm/config``.
+
+    Every field is optional — only the keys that are present get written
+    through to the underlying ``llm_config.toml`` files. ``api_key`` has
+    three-state semantics:
+        - missing / null → keep the existing value
+        - non-empty str  → overwrite both files
+        - empty str ""   → must come with ``clear_api_key=true``
+    """
+    provider:        str | None   = Field(default=None, max_length=64)
+    model:           str | None   = Field(default=None, max_length=200)
+    base_url:        str | None   = Field(default=None, max_length=500)
+    api_key:         str | None   = Field(default=None, max_length=2048)
+    clear_api_key:   bool         = Field(default=False)
+    temperature:     float | None = Field(default=None, ge=0, le=2)
+    max_tokens:      int | None   = Field(default=None, ge=1, le=200_000)
+    max_code_size:   int | None   = Field(default=None, ge=1024)
+    timeout_seconds: int | None   = Field(default=None, ge=1, le=3600)
+    api_key_env:     str | None   = Field(default=None, max_length=128)
+
+
+@app.get("/api/llm/config")
+def llm_get_config(user: dict = Depends(auth.current_user)) -> dict:
+    """Return the current merged LLM config with the api_key masked."""
+    cfg = llmcfg.read_config()
+    return llmcfg.public_view(cfg)
+
+
+@app.put("/api/llm/config")
+def llm_put_config(
+    body: LLMConfigBody,
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Write to both ``js-deobfuscator/llm_config.toml`` and
+    ``python-deobfuscator/llm_config.toml`` simultaneously.
+
+    Comments and unknown keys (multi-line prompts, ``rename_prompt``,
+    ``format_prompt``) are preserved by ``llm_config.write_config``.
+    """
+    payload: dict[str, Any] = body.model_dump(exclude_unset=True)
+    # When ``clear_api_key`` is set, drop any inadvertent api_key value
+    # so the writer takes the clear path.
+    if payload.get("clear_api_key"):
+        payload.pop("api_key", None)
+    elif "api_key" in payload and not (payload["api_key"] or "").strip():
+        # Empty string without explicit clear flag → treat as "no change".
+        payload.pop("api_key")
+    llmcfg.write_config(payload)
+    log.info(
+        "llm_config_updated %s",
+        kv(
+            user_id=user["id"],
+            keys_set=sorted(k for k in payload.keys() if k != "api_key"),
+            api_key_changed=bool(payload.get("api_key")) or bool(payload.get("clear_api_key")),
+            api_key_cleared=bool(payload.get("clear_api_key")),
+        ),
+    )
+    return llmcfg.public_view(llmcfg.read_config())
+
+
+@app.post("/api/llm/check")
+async def llm_check(
+    engine: str = Query("both", regex="^(js|py|both)$"),
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Probe the configured LLM by spawning the backends' built-in
+    health-check commands and timing the round-trip.
+
+    - JS: ``node dist/main.js --llm-check``
+    - PY: ``python tests/test_llm.py --max-tokens 8``
+
+    Returns ``{ok, engine, results: [{engine, ok, latency_ms, ...}]}``
+    so the frontend can render either one or two rows.
+    """
+    if not llmcfg.is_configured():
+        raise HTTPException(400, "llm not configured")
+
+    cfg = llmcfg.read_config()
+    targets: list[str] = []
+    if engine in ("js", "both"):
+        targets.append("js")
+    if engine in ("py", "both"):
+        targets.append("py")
+
+    results = []
+    for tgt in targets:
+        results.append(await _run_llm_check(tgt, cfg))
+    overall_ok = all(r.get("ok") for r in results) if results else False
+    log.info(
+        "llm_check %s",
+        kv(
+            user_id=user["id"],
+            engine=engine,
+            ok=overall_ok,
+            results=[{"engine": r["engine"], "ok": r["ok"]} for r in results],
+        ),
+    )
+    return {"ok": overall_ok, "engine": engine, "results": results}
+
+
+async def _run_llm_check(target: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Spawn one backend's --llm-check and parse exit code + stderr/out."""
+    started = time.perf_counter()
+    if target == "js":
+        repo = runner._js_repo_dir()
+        main_js = repo / "dist" / "main.js"
+        if not main_js.exists():
+            return {
+                "engine": "js", "ok": False,
+                "error": "JS backend is not built",
+                "latency_ms": 0,
+                "model": cfg.get("model") or "",
+            }
+        args = ["node", str(main_js), "--llm-check"]
+        cwd = str(repo)
+    else:
+        repo = runner._py_repo_dir()
+        test_py = repo / "tests" / "test_llm.py"
+        if not test_py.exists():
+            return {
+                "engine": "py", "ok": False,
+                "error": "Python LLM check is unavailable",
+                "latency_ms": 0,
+                "model": cfg.get("model") or "",
+            }
+        args = [sys.executable, str(test_py), "--max-tokens", "8"]
+        cwd = str(repo)
+
+    env = {**os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0"}
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            await proc.wait()
+            return {
+                "engine": target, "ok": False,
+                "error": "timeout (30s)",
+                "latency_ms": int((time.perf_counter() - started) * 1000),
+                "model": cfg.get("model") or "",
+            }
+        rc = proc.returncode or 0
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        text = (stdout or b"").decode("utf-8", errors="replace")
+        result: dict[str, Any] = {
+            "engine":     target,
+            "ok":         rc == 0,
+            "latency_ms": latency_ms,
+            "model":      cfg.get("model") or "",
+            "provider":   cfg.get("provider") or "",
+        }
+        if rc != 0:
+            result["error"] = _safe_llm_check_error(text, rc)
+            result["exit_code"] = rc
+        return result
+    except FileNotFoundError as exc:
+        process_log.warning(
+            "llm_check_executable_missing %s",
+            kv(engine=target, error=repr(exc)),
+        )
+        return {
+            "engine": target, "ok": False,
+            "error": "required executable is unavailable",
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "model": cfg.get("model") or "",
+        }
+
+
+def _safe_llm_check_error(text: str, exit_code: int) -> str:
+    """Convert noisy backend output into a UI-safe one-line reason.
+
+    LLM probes can print local paths, stack traces, provider URLs, or parts
+    of a configured API key. The Settings screen only needs the category.
+    """
+    raw = text or ""
+    lowered = raw.lower()
+    if "invalid_api_key" in lowered or "incorrect api key" in lowered or "authenticationerror" in lowered:
+        return "authentication failed (invalid API key)"
+    if "401" in lowered and "api key" in lowered:
+        return "authentication failed (invalid API key)"
+    if "unicodeencodeerror" in lowered or "charmap" in lowered:
+        return "LLM check failed while writing console output"
+    if "timeout" in lowered:
+        return "LLM check timed out"
+    if "rate_limit" in lowered or "rate limit" in lowered or "429" in lowered:
+        return "provider rate limit reached"
+    if "connection" in lowered or "econnrefused" in lowered or "connecterror" in lowered:
+        return "provider endpoint is unreachable"
+    return f"LLM check failed (exit {exit_code})"
+
+
 # ─── public ──────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 def health() -> dict:
+    """Cheap status pill source for the frontend Header.
+
+    “online” here means “the backend is reachable and looks runnable” —
+    we don’t spin up a full subprocess on every poll. The JS engine
+    requires its ``dist/main.js`` to exist; the Python engine just needs
+    its ``src/main.py``. ``llm.online`` mirrors whether an API key is
+    actually configured (use ``POST /api/llm/check`` for a deeper probe).
+    """
+    js_repo = runner._js_repo_dir()
+    py_repo = runner._py_repo_dir()
+    js_ok = (js_repo / "dist" / "main.js").exists()
+    py_ok = (py_repo / "src" / "main.py").exists()
+
+    cfg = llmcfg.read_config()
+    llm_online = bool(str(cfg.get("api_key") or "").strip())
+
     return {
-        "ok": True,
-        "engines": {"jsdeobf": "online", "pydeobf": "online"},
-        "llm": {"provider": "openai", "model": "gpt-4o", "online": True},
+        "ok": js_ok or py_ok,
+        "engines": {
+            "jsdeobf": "online" if js_ok else "offline",
+            "pydeobf": "online" if py_ok else "offline",
+        },
+        "llm": {
+            "provider": cfg.get("provider") or "",
+            "model":    cfg.get("model") or "",
+            "online":   llm_online,
+        },
         "jobs_in_memory": len(JOBS),
     }
 
@@ -600,18 +960,145 @@ def sessions(user: dict = Depends(auth.current_user)) -> list[dict]:
     return out
 
 
+@app.delete("/api/sessions")
+def sessions_clear(user: dict = Depends(auth.current_user)) -> dict:
+    """Bulk-delete every job belonging to the current user.
+
+    Used by Settings → Data → "Clear history". Cancels any in-flight
+    jobs first so we don't strand running coroutines on deleted rows,
+    then removes the per-job working directory under ``runs/``.
+    """
+    in_flight = [j for j in JOBS.values() if j.user_id == user["id"]]
+    for job in in_flight:
+        if job._cancel is not None and job.status in ("queued", "running"):
+            job._cancel.set()
+        JOBS.pop(job.id, None)
+
+    job_ids = db.all_job_ids_for_user(user["id"])
+    for job_id in job_ids:
+        work_dir = RUNS_DIR / job_id
+        if work_dir.exists():
+            shutil.rmtree(work_dir, ignore_errors=True)
+    deleted = db.delete_jobs_for_user(user["id"])
+    job_log.info(
+        "sessions_cleared %s",
+        kv(user_id=user["id"], deleted=deleted, in_flight=len(in_flight)),
+    )
+    return {"ok": True, "deleted": deleted}
+
+
+@app.get("/api/export")
+def export_jobs(user: dict = Depends(auth.current_user)) -> StreamingResponse:
+    """Stream a ZIP archive of every finished job owned by the caller.
+
+    Layout per job::
+        <job_id>/
+            report.json     # full result bundle (stats, iocs, mitre, sha256)
+            original.<ext>  # original_code as uploaded
+            cleaned.<ext>   # clean_code (post-deobfuscation)
+            diff.patch      # unified diff (when present)
+
+    Jobs without a finished ``result`` (queued/error/cancelled) are
+    skipped — the export is best-effort and never fails the whole
+    archive on a single bad row.
+    """
+    rows = db.jobs_for_user(user["id"], limit=10_000)
+
+    def _ext_for(lang: str) -> str:
+        return "py" if lang == "py" else "js"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        included = 0
+        for r in rows:
+            result = r.get("result")
+            if not result:
+                continue
+            ext = _ext_for(r.get("lang") or "")
+            base = f"{r['id']}_{Path(r['filename']).stem}"
+            try:
+                zf.writestr(
+                    f"{base}/report.json",
+                    json.dumps(
+                        {**result, "id": r["id"], "filename": r["filename"]},
+                        ensure_ascii=False, indent=2,
+                    ),
+                )
+                if result.get("original_code"):
+                    zf.writestr(f"{base}/original.{ext}", result["original_code"])
+                if result.get("clean_code"):
+                    zf.writestr(f"{base}/cleaned.{ext}", result["clean_code"])
+                if result.get("diff_code"):
+                    zf.writestr(f"{base}/diff.patch", result["diff_code"])
+                included += 1
+            except Exception as exc:  # noqa: BLE001 — never abort the whole zip
+                log.warning(
+                    "export_skip %s",
+                    kv(user_id=user["id"], job_id=r.get("id"), error=repr(exc)),
+                )
+        # Top-level manifest so the user can spot missing jobs.
+        zf.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "user_id":   user["id"],
+                    "exported":  included,
+                    "total":     len(rows),
+                    "generated": datetime.now(timezone.utc).isoformat(),
+                },
+                ensure_ascii=False, indent=2,
+            ),
+        )
+    buf.seek(0)
+    log.info(
+        "export %s",
+        kv(user_id=user["id"], jobs=len(rows), bytes=buf.getbuffer().nbytes),
+    )
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    fname = f"unveil-export-{stamp}.zip"
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
+    # Per-run options ──────────────────────────────────────────────────────
+    # New (preferred): granular four-way LLM mode.
+    llm_mode: str | None = Form(None),
+    # Legacy fallback — maps ``true`` → “both” when ``llm_mode`` is omitted.
     use_llm: bool = Form(False),
     dynamic_eval: bool = Form(True),
     auto_ioc: bool = Form(True),
+    static_analysis: bool = Form(True),
+    rename: bool = Form(True),
+    max_layers: int | None = Form(None),
+    timeout: int | None = Form(None),
+    verbose: bool = Form(True),
     lang_hint: str | None = Form(None),
     speed: str = Form("normal"),
     user: dict = Depends(auth.current_user),
 ) -> dict:
     if speed not in ("normal", "fast"):
         raise HTTPException(400, "speed must be 'normal' or 'fast'")
+    # Resolve llm_mode — explicit value wins, otherwise legacy use_llm decides.
+    if llm_mode is None:
+        llm_mode = "both" if use_llm else "off"
+    if llm_mode not in VALID_LLM_MODES:
+        raise HTTPException(
+            400, f"llm_mode must be one of {VALID_LLM_MODES!r}"
+        )
+    if llm_mode != "off" and not llmcfg.is_configured():
+        # Frontend treats this as “redirect to Settings → LLM”.
+        raise HTTPException(400, "llm not configured")
+    if max_layers is not None and max_layers <= 0:
+        max_layers = None
+    if timeout is not None and timeout <= 0:
+        timeout = None
+
     blob = await file.read()
     raw_name = file.filename or "upload.bin"
     safe_name = Path(raw_name).name or "upload.bin"
@@ -630,16 +1117,24 @@ async def analyze(
         filename=safe_name,
         size=len(blob),
         lang=lang,
-        use_llm=use_llm,
+        llm_mode=llm_mode,
         dynamic_eval=dynamic_eval,
         auto_ioc=auto_ioc,
+        static_analysis=static_analysis,
+        rename=rename,
+        max_layers=max_layers,
+        timeout=timeout,
+        verbose=verbose,
         speed=speed,
         input_path=str(input_path),
     )
     job._event = asyncio.Event()
     job._cancel = asyncio.Event()
     JOBS[job.id] = job
-    db.insert_job(job.id, user["id"], job.filename, job.size, job.lang, "queued")
+    db.insert_job(
+        job.id, user["id"], job.filename, job.size, job.lang,
+        "queued", options=job.options_dict(),
+    )
     job_log.info(
         "job_queued %s",
         kv(
@@ -650,10 +1145,7 @@ async def analyze(
             sha256=sha256[:16],
             lang=job.lang,
             lang_hint=lang_hint,
-            speed=speed,
-            use_llm=use_llm,
-            dynamic_eval=dynamic_eval,
-            auto_ioc=auto_ioc,
+            **job.options_dict(),
         ),
     )
     asyncio.create_task(run_job(job))
@@ -670,16 +1162,22 @@ def _load_job_for_user(job_id: str, user_id: int) -> Job | None:
     row = db.get_job(job_id)
     if not row or row["user_id"] != user_id:
         return None
+    saved_opts = row.get("options") or {}
     snap = Job(
         id=row["id"],
         user_id=row["user_id"],
         filename=row["filename"],
         size=row["size"],
         lang=row["lang"],
-        use_llm=False,
-        dynamic_eval=True,
-        auto_ioc=True,
-        speed="normal",
+        llm_mode=saved_opts.get("llm_mode", "off"),
+        dynamic_eval=saved_opts.get("dynamic_eval", True),
+        auto_ioc=saved_opts.get("auto_ioc", True),
+        static_analysis=saved_opts.get("static_analysis", True),
+        rename=saved_opts.get("rename", True),
+        max_layers=saved_opts.get("max_layers"),
+        timeout=saved_opts.get("timeout"),
+        verbose=saved_opts.get("verbose", True),
+        speed=saved_opts.get("speed", "normal"),
         status=row["status"],
         phase=row["phase"],
         progress=row["progress"],
@@ -706,6 +1204,7 @@ def get_job(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
         "logs": [l.as_dict() for l in job.logs],
         "result": job.result,
         "error": job.error,
+        "options": job.options_dict(),
     }
 
 
