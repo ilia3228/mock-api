@@ -114,9 +114,12 @@ query string.
 
 Form-data:
 
-- `file` (required) — uploaded sample.
+- `file` (required) — uploaded sample. ZIP archives containing exactly one
+  file are automatically extracted (MalwareBazaar compatibility). Password-
+  protected ZIPs are tried with the default password `infected`.
 - `use_llm` (`true` / `false`, default `false`) — forwards `--use-llm` to
-  the backend (LLM rename + format).
+  the backend (LLM rename + format). Requires an API key saved by the same
+  authenticated user; a key from another account is treated as absent.
 - `dynamic_eval` (`true` / `false`, default `true`) — forwards
   `--no-dynamic` when disabled.
 - `auto_ioc` (`true` / `false`, default `true`) — forwards `--no-ioc` when
@@ -165,10 +168,10 @@ API side:
 | `engine`        | `"jsdeobf"` / `"pydeobf"` based on detected language.           |
 | `sha256`        | `hashlib.sha256` of the uploaded blob.                          |
 | `original_code` | raw uploaded blob, UTF-8 decoded (replace on error).            |
-| `clean_code`    | JS: `report.outputPath`. PY: `final_result.py` / last layer.    |
+| `clean_code`    | JS/PY: `report.outputPath` with backend-specific fallback.       |
 | `diff_code`     | `difflib.unified_diff(original_code, clean_code)`.              |
-| `layer_cards`   | JS: mapped from `report.json#/layers[]`. PY: synthesised from `layer_*.py` file sizes. |
-| `iocs`          | JS: parsed from `layer_0_ioc_report.js`. PY: parsed from `ioc_report.json` written by the orchestrator's `_dump_ioc_report`. Same `{type, value, sev}` shape both ways. |
+| `layer_cards`   | JS/PY: mapped from `report.json#/layers[]`.                      |
+| `iocs`          | JS: parsed from `layer_0_ioc_report.js`. PY: parsed from `ioc_report.json`; `report.json#/ioc` carries severity summary. Same `{type, value, sev}` shape both ways. |
 | `mitre`         | Heuristic on the API side (`runner.derive_mitre`) — always `T1027` + language `T1059.*`, plus `T1041` / `T1547.001` / `T1552.001` from IOC types. |
 
 ## Notes
@@ -176,8 +179,8 @@ API side:
 - CORS is wide-open for `http://localhost:5173` and `http://127.0.0.1:5173`.
 - `sample_data.py` is kept only for `PHASES` (served at `/api/phases`).
   Everything else in that file (including the legacy `PY_IOCS` stub) is
-  unused by the running API — Python IOCs now come from the orchestrator's
-  `ioc_report.json`.
+  unused by the running API — Python metadata now comes from `report.json`,
+  while IOC values come from `ioc_report.json`.
 - `runs/<job_id>/` contains the uploaded blob plus the backend's output
   (`out/`). `DELETE /api/jobs/{job_id}` removes both the DB row and the
   on-disk run directory.

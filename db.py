@@ -4,6 +4,7 @@ Tables
 ------
 - users(id, email, name, pw_hash, pw_salt, created_at)
 - tokens(token, user_id, created_at)
+- llm_key_owner(id, user_id, updated_at)
 - jobs(id, user_id, filename, size, lang, status, phase, progress,
        result_json, error, created_at, updated_at)
 
@@ -55,6 +56,12 @@ def init() -> None:
                 created_at  REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS tokens_user_idx ON tokens(user_id);
+
+            CREATE TABLE IF NOT EXISTS llm_key_owner (
+                id          INTEGER PRIMARY KEY CHECK (id = 1),
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                updated_at  REAL NOT NULL
+            );
 
             CREATE TABLE IF NOT EXISTS jobs (
                 id           TEXT PRIMARY KEY,
@@ -127,6 +134,15 @@ def user_by_id(user_id: int) -> dict[str, Any] | None:
 
 # ─── tokens ─────────────────────────────────────────────────────────────────
 
+def single_user_id() -> int | None:
+    """Return the only user id in the DB, or None when there are 0 or 2+."""
+    with _LOCK:
+        rows = _conn().execute(
+            "SELECT id FROM users ORDER BY id ASC LIMIT 2"
+        ).fetchall()
+    return int(rows[0]["id"]) if len(rows) == 1 else None
+
+
 def insert_token(token: str, user_id: int) -> None:
     with _LOCK:
         _conn().execute(
@@ -150,6 +166,47 @@ def delete_token(token: str) -> None:
 
 
 # ─── jobs ───────────────────────────────────────────────────────────────────
+
+def llm_key_owner_user_id() -> int | None:
+    """Return the user id that owns the shared on-disk LLM key, if any."""
+    with _LOCK:
+        row = _conn().execute(
+            "SELECT user_id FROM llm_key_owner WHERE id = 1"
+        ).fetchone()
+        return int(row["user_id"]) if row else None
+
+
+def set_llm_key_owner(user_id: int) -> None:
+    """Mark ``user_id`` as the owner of the currently stored LLM API key."""
+    with _LOCK:
+        _conn().execute(
+            """
+            INSERT INTO llm_key_owner(id, user_id, updated_at)
+            VALUES(1, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
+                updated_at = excluded.updated_at
+            """,
+            (user_id, time.time()),
+        )
+
+
+def clear_llm_key_owner(user_id: int | None = None) -> bool:
+    """Clear the stored LLM key owner.
+
+    When ``user_id`` is provided, the row is removed only if that user owns
+    it. Returns True when a row was deleted.
+    """
+    with _LOCK:
+        if user_id is None:
+            cur = _conn().execute("DELETE FROM llm_key_owner WHERE id = 1")
+        else:
+            cur = _conn().execute(
+                "DELETE FROM llm_key_owner WHERE id = 1 AND user_id = ?",
+                (user_id,),
+            )
+        return (cur.rowcount or 0) > 0
+
 
 def insert_job(
     job_id: str,

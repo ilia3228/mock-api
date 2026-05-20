@@ -235,6 +235,39 @@ def _sniff_lang(content: bytes | None) -> str | None:
     return None
 
 
+ZIP_DEFAULT_PASSWORD = b"infected"
+
+
+def _try_extract_zip(blob: bytes) -> tuple[str, bytes] | None:
+    """If *blob* is a ZIP archive with exactly one file, extract and return
+    ``(inner_filename, inner_bytes)``.  Password-protected archives are
+    tried first without a password, then with the MalwareBazaar default
+    password ``infected``.  Returns ``None`` if *blob* is not a valid ZIP
+    or contains != 1 file.
+    """
+    if not zipfile.is_zipfile(io.BytesIO(blob)):
+        return None
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile:
+        return None
+    members = [m for m in zf.infolist() if not m.is_dir()]
+    if len(members) != 1:
+        return None
+    member = members[0]
+    for pwd in (None, ZIP_DEFAULT_PASSWORD):
+        try:
+            data = zf.read(member.filename, pwd=pwd)
+            inner_name = Path(member.filename).name or "extracted.bin"
+            return inner_name, data
+        except RuntimeError:
+            # "Bad password" or "requires password" → try next
+            continue
+        except Exception:
+            return None
+    return None
+
+
 def detect_lang(filename: str, hint: str | None, content: bytes | None = None) -> str:
     if hint in ("js", "py"):
         return hint
@@ -533,9 +566,23 @@ async def log_requests(request: Request, call_next):  # noqa: ANN001, ANN201
     return response
 
 
+def _adopt_legacy_llm_key_owner() -> None:
+    if db.llm_key_owner_user_id() is not None or not llmcfg.is_configured():
+        return
+    only_user_id = db.single_user_id()
+    if only_user_id is None:
+        llmcfg.clear_verified_fingerprint()
+        log.warning("llm_key_unowned_legacy_config")
+        return
+    db.set_llm_key_owner(only_user_id)
+    llmcfg.clear_verified_fingerprint()
+    log.info("llm_key_legacy_owner_adopted %s", kv(user_id=only_user_id))
+
+
 @app.on_event("startup")
 def _startup() -> None:
     db.init()
+    _adopt_legacy_llm_key_owner()
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     # Diagnostic — confirm that the running event loop is the Proactor
     # variant on Windows so subprocess spawns actually work. Logged once
@@ -697,6 +744,11 @@ def delete_me(
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
 
+    if _llm_key_owned_by(user):
+        llmcfg.write_config({"clear_api_key": True})
+        db.clear_llm_key_owner(int(user["id"]))
+        llmcfg.clear_verified_fingerprint()
+
     db.delete_user(user["id"])  # CASCADE clears tokens + jobs
     log.warning(
         "auth_account_deleted %s",
@@ -729,11 +781,57 @@ class LLMConfigBody(BaseModel):
     api_key_env:     str | None   = Field(default=None, max_length=128)
 
 
+def _llm_key_owner_id() -> int | None:
+    return db.llm_key_owner_user_id()
+
+
+def _llm_key_owned_by(user: dict[str, Any]) -> bool:
+    return _llm_key_owner_id() == int(user["id"])
+
+
+def _llm_configured_for_user(user: dict[str, Any]) -> bool:
+    return _llm_key_owned_by(user) and llmcfg.is_configured()
+
+
+def _llm_public_view_for_user(cfg: dict[str, Any], user: dict[str, Any]) -> dict:
+    owns_key = _llm_key_owned_by(user)
+    effective_cfg = cfg if owns_key else {**cfg, "api_key": ""}
+    view = llmcfg.public_view(effective_cfg)
+    view["api_key_owned"] = owns_key and bool(view["api_key_present"])
+    view["verified"] = (
+        llmcfg.is_verified(cfg, user_id=int(user["id"]))
+        if owns_key else False
+    )
+    return view
+
+
 @app.get("/api/llm/config")
-def llm_get_config(user: dict = Depends(auth.current_user)) -> dict:
-    """Return the current merged LLM config with the api_key masked."""
+def llm_get_config(
+    reveal: bool = Query(False),
+    user: dict = Depends(auth.current_user),
+) -> dict:
+    """Return the current merged LLM config.
+
+    By default the ``api_key`` is replaced by ``api_key_present`` +
+    ``api_key_last4`` so the secret never crosses the network. When the
+    caller explicitly opts in via ``?reveal=1`` we additionally include
+    the plaintext ``api_key`` — used by the Settings "show" button so
+    operators can copy/edit a previously-saved key without re-typing it.
+
+    Reveal requires the bearer token for the same user that saved the key;
+    other users see the shared test config as if no key were present.
+    """
     cfg = llmcfg.read_config()
-    return llmcfg.public_view(cfg)
+    view = _llm_public_view_for_user(cfg, user)
+    if reveal:
+        if not _llm_key_owned_by(user) or not str(cfg.get("api_key") or "").strip():
+            raise HTTPException(403, "llm api key is not owned by this user")
+        view["api_key"] = str(cfg.get("api_key") or "")
+        log.info(
+            "llm_config_reveal %s",
+            kv(user_id=user["id"], api_key_present=view["api_key_present"]),
+        )
+    return view
 
 
 @app.put("/api/llm/config")
@@ -755,17 +853,43 @@ def llm_put_config(
     elif "api_key" in payload and not (payload["api_key"] or "").strip():
         # Empty string without explicit clear flag → treat as "no change".
         payload.pop("api_key")
+    if "api_key" in payload:
+        payload["api_key"] = str(payload["api_key"]).strip()
+
+    owner_id = _llm_key_owner_id()
+    owns_key = owner_id == int(user["id"])
+    key_being_set = "api_key" in payload
+    key_being_cleared = bool(payload.get("clear_api_key"))
+
+    if key_being_cleared and not owns_key:
+        raise HTTPException(403, "llm api key is not owned by this user")
+    if not key_being_set and not key_being_cleared and llmcfg.is_configured() and not owns_key:
+        raise HTTPException(
+            403,
+            "llm api key is not owned by this user; paste a new key to replace it",
+        )
+
     llmcfg.write_config(payload)
+    if key_being_set:
+        db.set_llm_key_owner(int(user["id"]))
+        llmcfg.clear_verified_fingerprint()
+    elif key_being_cleared:
+        db.clear_llm_key_owner(int(user["id"]))
+        llmcfg.clear_verified_fingerprint()
+    elif not llmcfg.is_configured():
+        db.clear_llm_key_owner(int(user["id"]))
     log.info(
         "llm_config_updated %s",
         kv(
             user_id=user["id"],
             keys_set=sorted(k for k in payload.keys() if k != "api_key"),
-            api_key_changed=bool(payload.get("api_key")) or bool(payload.get("clear_api_key")),
-            api_key_cleared=bool(payload.get("clear_api_key")),
+            api_key_changed=key_being_set or key_being_cleared,
+            api_key_cleared=key_being_cleared,
+            previous_owner_id=owner_id,
+            owner_id=_llm_key_owner_id(),
         ),
     )
-    return llmcfg.public_view(llmcfg.read_config())
+    return _llm_public_view_for_user(llmcfg.read_config(), user)
 
 
 @app.post("/api/llm/check")
@@ -782,7 +906,7 @@ async def llm_check(
     Returns ``{ok, engine, results: [{engine, ok, latency_ms, ...}]}``
     so the frontend can render either one or two rows.
     """
-    if not llmcfg.is_configured():
+    if not _llm_configured_for_user(user):
         raise HTTPException(400, "llm not configured")
 
     cfg = llmcfg.read_config()
@@ -796,6 +920,14 @@ async def llm_check(
     for tgt in targets:
         results.append(await _run_llm_check(tgt, cfg))
     overall_ok = all(r.get("ok") for r in results) if results else False
+    # Persist the "verified" stamp server-side so it survives page
+    # refreshes and server restarts. Stamp on full success only — a
+    # mixed result (one engine ok, one failing) means LLM mode is not
+    # safely usable from the upload screen yet.
+    if overall_ok:
+        llmcfg.write_verified_fingerprint(llmcfg.fingerprint_for(cfg), user_id=int(user["id"]))
+    else:
+        llmcfg.clear_verified_fingerprint()
     log.info(
         "llm_check %s",
         kv(
@@ -836,7 +968,18 @@ async def _run_llm_check(target: str, cfg: dict[str, Any]) -> dict[str, Any]:
         args = [sys.executable, str(test_py), "--max-tokens", "8"]
         cwd = str(repo)
 
-    env = {**os.environ, "NO_COLOR": "1", "FORCE_COLOR": "0"}
+    # Force UTF-8 stdout in the subprocess so the Python smoke test's
+    # box-drawing chars (───) don't crash with UnicodeEncodeError when the
+    # mock-api itself happens to be running under a non-UTF-8 locale
+    # (e.g. cp1251 on Russian Windows). PYTHONIOENCODING covers <3.13 and
+    # PYTHONUTF8 covers the modern "UTF-8 mode" toggle. Harmless for Node.
+    env = {
+        **os.environ,
+        "NO_COLOR": "1",
+        "FORCE_COLOR": "0",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1",
+    }
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
@@ -960,109 +1103,6 @@ def sessions(user: dict = Depends(auth.current_user)) -> list[dict]:
     return out
 
 
-@app.delete("/api/sessions")
-def sessions_clear(user: dict = Depends(auth.current_user)) -> dict:
-    """Bulk-delete every job belonging to the current user.
-
-    Used by Settings → Data → "Clear history". Cancels any in-flight
-    jobs first so we don't strand running coroutines on deleted rows,
-    then removes the per-job working directory under ``runs/``.
-    """
-    in_flight = [j for j in JOBS.values() if j.user_id == user["id"]]
-    for job in in_flight:
-        if job._cancel is not None and job.status in ("queued", "running"):
-            job._cancel.set()
-        JOBS.pop(job.id, None)
-
-    job_ids = db.all_job_ids_for_user(user["id"])
-    for job_id in job_ids:
-        work_dir = RUNS_DIR / job_id
-        if work_dir.exists():
-            shutil.rmtree(work_dir, ignore_errors=True)
-    deleted = db.delete_jobs_for_user(user["id"])
-    job_log.info(
-        "sessions_cleared %s",
-        kv(user_id=user["id"], deleted=deleted, in_flight=len(in_flight)),
-    )
-    return {"ok": True, "deleted": deleted}
-
-
-@app.get("/api/export")
-def export_jobs(user: dict = Depends(auth.current_user)) -> StreamingResponse:
-    """Stream a ZIP archive of every finished job owned by the caller.
-
-    Layout per job::
-        <job_id>/
-            report.json     # full result bundle (stats, iocs, mitre, sha256)
-            original.<ext>  # original_code as uploaded
-            cleaned.<ext>   # clean_code (post-deobfuscation)
-            diff.patch      # unified diff (when present)
-
-    Jobs without a finished ``result`` (queued/error/cancelled) are
-    skipped — the export is best-effort and never fails the whole
-    archive on a single bad row.
-    """
-    rows = db.jobs_for_user(user["id"], limit=10_000)
-
-    def _ext_for(lang: str) -> str:
-        return "py" if lang == "py" else "js"
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        included = 0
-        for r in rows:
-            result = r.get("result")
-            if not result:
-                continue
-            ext = _ext_for(r.get("lang") or "")
-            base = f"{r['id']}_{Path(r['filename']).stem}"
-            try:
-                zf.writestr(
-                    f"{base}/report.json",
-                    json.dumps(
-                        {**result, "id": r["id"], "filename": r["filename"]},
-                        ensure_ascii=False, indent=2,
-                    ),
-                )
-                if result.get("original_code"):
-                    zf.writestr(f"{base}/original.{ext}", result["original_code"])
-                if result.get("clean_code"):
-                    zf.writestr(f"{base}/cleaned.{ext}", result["clean_code"])
-                if result.get("diff_code"):
-                    zf.writestr(f"{base}/diff.patch", result["diff_code"])
-                included += 1
-            except Exception as exc:  # noqa: BLE001 — never abort the whole zip
-                log.warning(
-                    "export_skip %s",
-                    kv(user_id=user["id"], job_id=r.get("id"), error=repr(exc)),
-                )
-        # Top-level manifest so the user can spot missing jobs.
-        zf.writestr(
-            "manifest.json",
-            json.dumps(
-                {
-                    "user_id":   user["id"],
-                    "exported":  included,
-                    "total":     len(rows),
-                    "generated": datetime.now(timezone.utc).isoformat(),
-                },
-                ensure_ascii=False, indent=2,
-            ),
-        )
-    buf.seek(0)
-    log.info(
-        "export %s",
-        kv(user_id=user["id"], jobs=len(rows), bytes=buf.getbuffer().nbytes),
-    )
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    fname = f"unveil-export-{stamp}.zip"
-    return StreamingResponse(
-        iter([buf.getvalue()]),
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-    )
-
-
 @app.post("/api/analyze")
 async def analyze(
     file: UploadFile = File(...),
@@ -1091,7 +1131,7 @@ async def analyze(
         raise HTTPException(
             400, f"llm_mode must be one of {VALID_LLM_MODES!r}"
         )
-    if llm_mode != "off" and not llmcfg.is_configured():
+    if llm_mode != "off" and not _llm_configured_for_user(user):
         # Frontend treats this as “redirect to Settings → LLM”.
         raise HTTPException(400, "llm not configured")
     if max_layers is not None and max_layers <= 0:
@@ -1102,6 +1142,23 @@ async def analyze(
     blob = await file.read()
     raw_name = file.filename or "upload.bin"
     safe_name = Path(raw_name).name or "upload.bin"
+
+    # ── ZIP handling (MalwareBazaar compatibility) ────────────────────────
+    extracted = _try_extract_zip(blob)
+    if extracted is not None:
+        inner_name, inner_bytes = extracted
+        job_log.info(
+            "zip_extracted %s",
+            kv(
+                outer=safe_name,
+                inner=inner_name,
+                outer_bytes=len(blob),
+                inner_bytes=len(inner_bytes),
+            ),
+        )
+        safe_name = inner_name
+        blob = inner_bytes
+
     lang = detect_lang(safe_name, lang_hint, content=blob)
     sha256 = hashlib.sha256(blob).hexdigest() if blob else ""
 

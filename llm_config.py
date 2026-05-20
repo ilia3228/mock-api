@@ -31,6 +31,7 @@ Write contract (``write_config``):
 
 from __future__ import annotations
 
+import json
 import re
 import tomllib
 from pathlib import Path
@@ -45,6 +46,11 @@ JS_CONFIG = JS_REPO / "llm_config.toml"
 JS_EXAMPLE = JS_REPO / "llm_config.example.toml"
 PY_CONFIG = PY_REPO / "llm_config.toml"
 PY_EXAMPLE = PY_REPO / "llm_config.example.toml"
+
+# Sidecar file that stores the "Test connection" verification stamp so the
+# verified state survives both page refreshes and server restarts. Kept
+# next to ``data.db`` (same gitignore-pattern: never committed).
+VERIFIED_STATE = Path(__file__).resolve().parent / "llm_verified.json"
 
 
 # ─── read ────────────────────────────────────────────────────────────────────
@@ -111,6 +117,12 @@ def public_view(cfg: dict[str, Any]) -> dict[str, Any]:
         "timeout_seconds":  int(cfg.get("timeout_seconds") or 0),
         "api_key_present":  bool(api_key),
         "api_key_last4":    api_key[-4:] if len(api_key) >= 4 else "",
+        # Length of the stored key (0 when absent). Used by the Settings
+        # input placeholder so the "••••" stand-in matches the real key's
+        # width — real provider tokens are 40–100+ chars, so the previous
+        # fixed 8-dot placeholder looked misleadingly short.
+        "api_key_length":   len(api_key),
+        "verified":         is_verified(cfg),
     }
 
 
@@ -118,6 +130,89 @@ def is_configured() -> bool:
     """True iff both files exist (or can be created) AND have an api_key."""
     cfg = read_config()
     return bool(str(cfg.get("api_key") or "").strip())
+
+
+# ─── verified-connection fingerprint ────────────────────────────────────────
+# Persisted server-side so the "Test connection" stamp survives page
+# refreshes and server restarts, regardless of which browser the user was
+# on when they ran the check. The fingerprint is a hash of the four
+# connection-affecting fields (provider, model, base_url, api_key_last4)
+# so any change to the saved config automatically invalidates the stamp.
+
+def fingerprint_for(cfg: dict[str, Any]) -> str:
+    """Join the connection-defining fields into the canonical stamp string.
+
+    Must stay byte-identical to the frontend's previous
+    ``llmConfigFingerprint`` helper so any in-flight ``llm_verified.json``
+    files from prior client-side stamps still resolve correctly.
+    """
+    api_key = str(cfg.get("api_key") or "").strip()
+    last4 = api_key[-4:] if len(api_key) >= 4 else ""
+    return "|".join([
+        str(cfg.get("provider") or ""),
+        str(cfg.get("model") or ""),
+        str(cfg.get("base_url") or ""),
+        last4,
+    ])
+
+
+def read_verified_state() -> dict[str, Any]:
+    """Return the stored verification state, or an empty dict."""
+    if not VERIFIED_STATE.exists():
+        return {}
+    try:
+        data = json.loads(VERIFIED_STATE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def read_verified_fingerprint() -> str:
+    """Return the stored fingerprint, or '' if no successful test on record."""
+    return str(read_verified_state().get("fingerprint") or "")
+
+
+def write_verified_fingerprint(fp: str, user_id: int | None = None) -> None:
+    """Persist ``fp`` as the latest 'Test connection succeeded' stamp.
+
+    Writes atomically through a tempfile so a crash mid-write never leaves
+    a half-truncated JSON behind.
+    """
+    try:
+        tmp = VERIFIED_STATE.with_suffix(VERIFIED_STATE.suffix + ".tmp")
+        data: dict[str, Any] = {"fingerprint": fp}
+        if user_id is not None:
+            data["user_id"] = int(user_id)
+        tmp.write_text(
+            json.dumps(data, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        tmp.replace(VERIFIED_STATE)
+    except Exception:
+        # Persistence is best-effort: a missing/unwritable state file
+        # only costs the user one extra Test-connection click.
+        pass
+
+
+def clear_verified_fingerprint() -> None:
+    """Remove the stored fingerprint (next Test connection re-stamps it)."""
+    try:
+        VERIFIED_STATE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def is_verified(cfg: dict[str, Any], user_id: int | None = None) -> bool:
+    """True iff there's a stored fingerprint matching ``cfg``'s connection."""
+    if not str(cfg.get("api_key") or "").strip():
+        return False
+    state = read_verified_state()
+    stored = str(state.get("fingerprint") or "")
+    if not stored or stored != fingerprint_for(cfg):
+        return False
+    if user_id is None:
+        return True
+    return state.get("user_id") == int(user_id)
 
 
 # ─── write ───────────────────────────────────────────────────────────────────
@@ -176,11 +271,21 @@ def write_config(payload: dict[str, Any]) -> None:
     Comments, blank lines, multi-line strings (``rename_prompt`` etc.) and
     unknown keys are preserved. Missing files are bootstrapped from the
     matching ``llm_config.example.toml``.
+
+    Side effect: when any of the connection-defining fields (provider,
+    model, base_url, api_key) actually change as a result of this write,
+    the persisted "Test connection" stamp is cleared. Tweaks to neutral
+    fields (temperature, max_tokens, …) leave it intact so the user
+    doesn't get bounced back to the verify step for unrelated edits.
     """
     _ensure_exists(JS_CONFIG, JS_EXAMPLE)
     _ensure_exists(PY_CONFIG, PY_EXAMPLE)
+    before_fp = fingerprint_for(read_config())
     _update_toml_file(JS_CONFIG, _js_updates(payload))
     _update_toml_file(PY_CONFIG, _py_updates(payload))
+    after_fp = fingerprint_for(read_config())
+    if before_fp != after_fp:
+        clear_verified_fingerprint()
 
 
 # Matches a top-level ``key = …`` assignment line. Skips lines inside

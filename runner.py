@@ -417,10 +417,14 @@ def _js_iocs(run_dir: Path) -> list[dict]:
     return _parse_ioc_file(run_dir / "layer_0_ioc_report.js")
 
 
-def _py_iocs(result_dir: Path) -> list[dict]:
-    """Parse ``ioc_report.json`` produced by py-deobf (see orchestrator
-    ``_dump_ioc_report``). Shape mirrors the JS report.
+def _py_iocs(result_dir: Path, report: dict | None = None) -> list[dict]:
+    """Parse Python IOC findings, preferring report-embedded findings
+    when present and otherwise reading the flat ``ioc_report.json`` file.
     """
+    if isinstance(report, dict):
+        report_items = _ioc_items_from_data(report.get("ioc"))
+        if report_items:
+            return _normalize_ioc_items(report_items)
     return _parse_ioc_file(result_dir / "ioc_report.json")
 
 
@@ -448,16 +452,21 @@ def _parse_ioc_file(p: Path) -> list[dict]:
         except json.JSONDecodeError:
             return []
 
-    items: list[dict] = []
+    return _normalize_ioc_items(_ioc_items_from_data(data))
+
+
+def _ioc_items_from_data(data: object) -> list[dict]:
     if isinstance(data, list):
-        items = [x for x in data if isinstance(x, dict)]
-    elif isinstance(data, dict):
+        return [x for x in data if isinstance(x, dict)]
+    if isinstance(data, dict):
         for key in ("findings", "iocs", "items", "results"):
             v = data.get(key)
             if isinstance(v, list):
-                items = [x for x in v if isinstance(x, dict)]
-                break
+                return [x for x in v if isinstance(x, dict)]
+    return []
 
+
+def _normalize_ioc_items(items: list[dict]) -> list[dict]:
     out: list[dict] = []
     for it in items:
         sev = str(it.get("severity") or it.get("sev") or "low").lower()
@@ -480,6 +489,17 @@ def _py_repo_dir() -> Path:
     if env:
         return Path(env)
     return Path(__file__).resolve().parent.parent / "python-deobfuscator"
+
+
+def _py_executable(repo_dir: Path) -> str:
+    """Return the Python interpreter from python-deobfuscator's own venv if available."""
+    if sys.platform == "win32":
+        venv_python = repo_dir / ".venv" / "Scripts" / "python.exe"
+    else:
+        venv_python = repo_dir / ".venv" / "bin" / "python"
+    if venv_python.exists():
+        return str(venv_python)
+    return sys.executable
 
 
 async def run_py(
@@ -511,7 +531,7 @@ async def run_py(
         )
 
     args: list[str] = [
-        sys.executable, str(main_py), str(input_path),
+        _py_executable(repo_dir), str(main_py), str(input_path),
         "--output-dir", str(run_dir),
     ]
     args.append("-v" if verbose else "-q")
@@ -574,7 +594,20 @@ async def run_py(
         raise RuntimeError(f"py-deobf exited with code {rc}")
 
     result_dir = _py_find_result_dir(run_dir, input_path.stem)
-    clean_code = _py_find_clean(result_dir, input_path) if result_dir else ""
+    report_path = (result_dir / "report.json") if result_dir else (run_dir / "report.json")
+    if not report_path.exists():
+        process_log.error("backend_report_missing %s", kv(engine="pydeobf", report=str(report_path)))
+        raise RuntimeError(f"py-deobf did not produce report.json at {report_path}")
+    report = json.loads(report_path.read_text(encoding="utf-8", errors="replace"))
+
+    clean_code = ""
+    out_path_str = report.get("outputPath") or ""
+    if out_path_str:
+        out_path = Path(out_path_str)
+        if out_path.exists():
+            clean_code = out_path.read_text(encoding="utf-8", errors="replace")
+    if not clean_code and result_dir:
+        clean_code = _py_find_clean(result_dir, input_path)
     if not clean_code:
         # py-deobf produced nothing (input had nothing to deobfuscate, or
         # detection said `unknown`). Mirror the input back so the frontend
@@ -583,13 +616,13 @@ async def run_py(
             clean_code = input_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             clean_code = ""
-    layer_cards = _py_layer_cards(result_dir) if result_dir else []
-    iocs = _py_iocs(result_dir) if auto_ioc and result_dir else []
+    layer_cards = _py_layer_cards_from_report(report, result_dir or run_dir)
+    iocs = _py_iocs(result_dir or run_dir, report) if auto_ioc else []
     result = RunResult(
         clean_code=clean_code,
         layer_cards=layer_cards,
         iocs=iocs,
-        layers_seen=max(layers_seen, len(layer_cards)),
+        layers_seen=max(layers_seen, len(report.get("layers") or [])),
     )
     process_log.info(
         "backend_done %s",
@@ -616,13 +649,21 @@ def _py_find_result_dir(run_dir: Path, stem: str) -> Path | None:
     * Subdir — files dumped into ``run_dir/<stem>/`` (default layout
       under ``decoded_layers/<stem>/``).
     """
-    if (run_dir / "final_result.py").exists() or any(run_dir.glob("layer_*.py")):
+    if (
+        (run_dir / "report.json").exists()
+        or (run_dir / "final_result.py").exists()
+        or any(run_dir.glob("layer_*.py"))
+    ):
         return run_dir
     candidate = run_dir / stem
     if candidate.exists() and candidate.is_dir():
         return candidate
     for p in run_dir.iterdir():
-        if p.is_dir() and ((p / "final_result.py").exists() or any(p.glob("layer_*.py"))):
+        if p.is_dir() and (
+            (p / "report.json").exists()
+            or (p / "final_result.py").exists()
+            or any(p.glob("layer_*.py"))
+        ):
             return p
     return None
 
@@ -661,80 +702,36 @@ def _py_find_clean(result_dir: Path, input_path: Path) -> str:
     return ""
 
 
-# Final summary block that python-deobfuscator writes at the end of
-# every run, one line per processed layer::
-#
-#     Layer 1: detected=lambda_chain, methods=static_ast
-#     Layer 2: detected=lambda_chain, methods=none
-#
-# ``detected`` is the winning PatternDetect technique (snake_case, no
-# percentage). ``methods`` is either a single method name or several
-# joined with ``+`` (e.g. ``static_ast+dynamic``), or ``none`` when no
-# transform fired on that layer.
-_PY_LAYER_SUMMARY_RE = re.compile(
-    r"Layer\s+(\d+):\s+detected=(\S+),\s+methods=(\S+)"
-)
-
-
-def _parse_py_debug_log(result_dir: Path) -> dict[int, dict[str, object]]:
-    """Extract per-layer ``{detected, methods}`` from the python-deobfuscator
-    ``debug.log`` final summary. Returns ``{}`` if the log is missing.
-
-    This is the single source of truth for which obfuscation technique was
-    matched on each layer — the CLI's free-text ``[INFO] Detected: …``
-    lines emitted mid-run can be noisy (multiple candidates per layer
-    while confidence rises), but the trailing ``Layer N: detected=…``
-    block is the authoritative final verdict.
-    """
-    log_path = result_dir / "debug.log"
-    try:
-        text = log_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-    out: dict[int, dict[str, object]] = {}
-    for m in _PY_LAYER_SUMMARY_RE.finditer(text):
-        lid = int(m.group(1))
-        detected = m.group(2).strip()
-        methods_raw = m.group(3).strip()
-        methods = (
-            [] if methods_raw == "none"
-            else [s for s in methods_raw.split("+") if s]
-        )
-        out[lid] = {"detected": detected, "methods": methods}
-    return out
-
-
-def _py_layer_cards(result_dir: Path) -> list[dict]:
-    """Build per-layer cards for the frontend by pairing each
-    ``layer_*.py`` artefact with its detection metadata from
-    ``debug.log``. Falls back to ``"unknown"`` only when the log has no
-    summary for a given layer (very old python-deobfuscator versions, or
-    a partial run that crashed before the summary was written)."""
-    layers = sorted(result_dir.glob("layer_*.py"), key=lambda p: _trailing_int(p.stem))
-    metadata = _parse_py_debug_log(result_dir)
+def _py_layer_cards_from_report(report: dict, result_dir: Path) -> list[dict]:
+    """Build Python layer cards from the JS-compatible ``report.json``."""
     cards: list[dict] = []
-    prev_size: int | None = None
-    for i, f in enumerate(layers, 1):
-        size = f.stat().st_size
-        meta = metadata.get(i) or {}
-        detected = (meta.get("detected") or "unknown") or "unknown"
-        methods = meta.get("methods") or []
+    for entry in report.get("layers") or []:
+        lid = entry.get("layerId") or (len(cards) + 1)
+        layer_file = _py_layer_preview_path(result_dir, int(lid))
         cards.append({
-            "id": i,
-            "label": f"L{i}",
-            "obfuscator": detected,
-            "antiAnalysis": [],
-            "methods": methods,
-            "inputKB": round((prev_size if prev_size is not None else size) / 1024, 2),
-            "outputKB": round(size / 1024, 2),
+            "id": lid,
+            "label": f"L{lid}",
+            "obfuscator": entry.get("detectedObfuscator") or "unknown",
+            "antiAnalysis": list(entry.get("antiAnalysisFindings") or []),
+            "methods": list(entry.get("methodsApplied") or []),
+            "inputKB": round((entry.get("inputBytes") or 0) / 1024, 2),
+            "outputKB": round((entry.get("outputBytes") or 0) / 1024, 2),
             "timeMs": None,
             "entropy": None,
             "done": True,
-            "notes": [],
-            "preview": _read_text_capped(f),
+            "notes": list(entry.get("notes") or []),
+            "preview": _read_text_capped(layer_file) if layer_file else "",
         })
-        prev_size = size
     return cards
+
+
+def _py_layer_preview_path(result_dir: Path, layer_id: int) -> Path | None:
+    for suffix in (".py", ".pyc_dump", ".bin"):
+        candidate = result_dir / f"layer_{layer_id}{suffix}"
+        if candidate.exists():
+            return candidate
+    matches = sorted(result_dir.glob(f"layer_{layer_id}.*"))
+    return matches[0] if matches else None
 
 
 # Per-layer preview is what the frontend ResultsState renders in the
