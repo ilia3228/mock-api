@@ -7,8 +7,8 @@ run directory once the process exits.
 
 The two backend CLIs live in sibling repositories:
 
-    JS_DEOBF_DIR  -> ../js-deobfuscator          (node dist/main.js)
-    PY_DEOBF_DIR  -> ../python-deobfuscator      (python src/main.py)
+    JS_DEOBF_DIR  -> ../js_deobf                 (node dist/main.js)
+    PY_DEOBF_DIR  -> ../py_deobf                 (python src/main.py)
 
 Both can be overridden with environment variables of the same name.
 
@@ -82,8 +82,40 @@ def _float_env(name: str, default: float) -> float:
 
 
 BACKEND_IDLE_TIMEOUT_SECONDS = _float_env("MOCK_API_BACKEND_IDLE_TIMEOUT_SECONDS", 180.0)
-BACKEND_MAX_RUNTIME_SECONDS = _float_env("MOCK_API_BACKEND_MAX_RUNTIME_SECONDS", 600.0)
+BACKEND_MAX_RUNTIME_SECONDS = _float_env("MOCK_API_BACKEND_MAX_RUNTIME_SECONDS", 60.0)
 BACKEND_STOP_GRACE_SECONDS = _float_env("MOCK_API_BACKEND_STOP_GRACE_SECONDS", 5.0)
+
+# Python deobfuscator sandbox backend. py-deobf's CLI defaults to ``subprocess``,
+# which cannot decrypt AES-protected pyobfuscate.com / Hyperion / Fernet stealers
+# because the host venv is unlikely to have pycryptodome/cryptography installed
+# in the exact form those decryptor stubs expect. The Docker backend uses the
+# ``python-deobf-sandbox:latest`` image (see ``py_deobf/src/sandbox/docker/
+# Dockerfile.sandbox``) which has pycryptodome + cryptography + requests
+# pre-installed, so AES/CBC/GCM decryptor stubs run to completion and the real
+# stealer source is captured. Override with ``MOCK_API_PY_SANDBOX=subprocess``
+# for hosts without Docker.
+PY_SANDBOX_BACKEND = os.environ.get("MOCK_API_PY_SANDBOX", "docker").strip().lower()
+if PY_SANDBOX_BACKEND not in ("docker", "subprocess"):
+    process_log.warning(
+        "py_sandbox_invalid %s",
+        kv(value=PY_SANDBOX_BACKEND, fallback="docker"),
+    )
+    PY_SANDBOX_BACKEND = "docker"
+
+# JS deobfuscator sandbox backend. js-deobf's CLI defaults to ``vm``, which
+# runs untrusted JS inside the host node process and exposes the analysis
+# machine to packer payloads that escape Node's ``vm`` module. The Docker
+# backend isolates execution in a ``node:18`` container with ``--network none``,
+# matching the security posture of the Python backend. Override with
+# ``MOCK_API_JS_SANDBOX=vm`` (or ``puppeteer``, which requires the optional
+# Puppeteer peer dep) for hosts without Docker.
+JS_SANDBOX_BACKEND = os.environ.get("MOCK_API_JS_SANDBOX", "docker").strip().lower()
+if JS_SANDBOX_BACKEND not in ("docker", "vm", "puppeteer"):
+    process_log.warning(
+        "js_sandbox_invalid %s",
+        kv(value=JS_SANDBOX_BACKEND, fallback="docker"),
+    )
+    JS_SANDBOX_BACKEND = "docker"
 
 
 def _strip_ansi(s: str) -> str:
@@ -253,7 +285,7 @@ def _js_repo_dir() -> Path:
     env = os.environ.get("JS_DEOBF_DIR")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parent.parent / "js-deobfuscator"
+    return Path(__file__).resolve().parent.parent / "js_deobf"
 
 
 async def run_js(
@@ -288,6 +320,11 @@ async def run_js(
         "node", str(main_js), str(input_path),
         "--output-dir", str(run_dir),
         "--no-isolate-runs",
+        # Force the docker-based sandbox by default so untrusted JS runs
+        # inside a ``node:18`` container with ``--network none`` instead of
+        # the in-process ``vm`` module. ``MOCK_API_JS_SANDBOX`` overrides
+        # this for hosts without Docker.
+        "--backend", JS_SANDBOX_BACKEND,
     ]
     args.append("-v" if verbose else "-q")
     # JS backend exposes ‘use-llm’ (both), ‘use-llm-rename’, ‘use-llm-format’
@@ -317,6 +354,7 @@ async def run_js(
             engine="jsdeobf",
             input=str(input_path),
             output_dir=str(run_dir),
+            backend=JS_SANDBOX_BACKEND,
             llm_mode=llm_mode,
             dynamic_eval=dynamic_eval,
             auto_ioc=auto_ioc,
@@ -488,11 +526,11 @@ def _py_repo_dir() -> Path:
     env = os.environ.get("PY_DEOBF_DIR")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parent.parent / "python-deobfuscator"
+    return Path(__file__).resolve().parent.parent / "py_deobf"
 
 
 def _py_executable(repo_dir: Path) -> str:
-    """Return the Python interpreter from python-deobfuscator's own venv if available."""
+    """Return the Python interpreter from py_deobf's own venv if available."""
     if sys.platform == "win32":
         venv_python = repo_dir / ".venv" / "Scripts" / "python.exe"
     else:
@@ -533,6 +571,12 @@ async def run_py(
     args: list[str] = [
         _py_executable(repo_dir), str(main_py), str(input_path),
         "--output-dir", str(run_dir),
+        # Force the docker-based sandbox by default so AES-protected
+        # pyobfuscate.com / Hyperion / Fernet decryptor stubs run inside
+        # an image that already has pycryptodome + cryptography + requests
+        # available. ``MOCK_API_PY_SANDBOX`` switches this to ``subprocess``
+        # for hosts without Docker.
+        "--sandbox", PY_SANDBOX_BACKEND,
     ]
     args.append("-v" if verbose else "-q")
     # PY backend uses ‘--use-llm’ (both), ‘--llm-rename’, ‘--llm-format’.
@@ -561,6 +605,7 @@ async def run_py(
             engine="pydeobf",
             input=str(input_path),
             output_dir=str(run_dir),
+            sandbox=PY_SANDBOX_BACKEND,
             llm_mode=llm_mode,
             dynamic_eval=dynamic_eval,
             auto_ioc=auto_ioc,
@@ -640,7 +685,7 @@ async def run_py(
 
 
 def _py_find_result_dir(run_dir: Path, stem: str) -> Path | None:
-    """Locate the directory the python-deobfuscator wrote into.
+    """Locate the directory the py_deobf backend wrote into.
 
     Two known layouts depending on whether ``--output-dir`` is set:
 

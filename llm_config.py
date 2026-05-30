@@ -39,8 +39,8 @@ from typing import Any
 
 _ROOT = Path(__file__).resolve().parent.parent
 
-JS_REPO = _ROOT / "js-deobfuscator"
-PY_REPO = _ROOT / "python-deobfuscator"
+JS_REPO = _ROOT / "js_deobf"
+PY_REPO = _ROOT / "py_deobf"
 
 JS_CONFIG = JS_REPO / "llm_config.toml"
 JS_EXAMPLE = JS_REPO / "llm_config.example.toml"

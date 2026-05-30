@@ -4,9 +4,9 @@ HTTP API for `deobfuscator-app`. Dispatches uploaded files to one of two
 real deobfuscators based on filename detection:
 
 - **jsdeobf** — `.js` files → `node dist/main.js` from
-  `../js-deobfuscator`.
+  `../js_deobf`.
 - **pydeobf** — `.py` / `.pyc` files → `python src/main.py` from
-  `../python-deobfuscator`.
+  `../py_deobf`.
 
 The API persists users, tokens and job metadata in a local SQLite file
 (`data.db`) and stores each job's working directory under `runs/<job_id>/`
@@ -66,6 +66,17 @@ Environment variables:
   producing output.
 - `MOCK_API_BACKEND_MAX_RUNTIME_SECONDS=600` kills a backend that runs too long
   even if it keeps printing.
+- `MOCK_API_PY_SANDBOX=docker|subprocess` (default `docker`). The Python
+  deobfuscator's sandbox backend. Docker is required to recover AES-protected
+  pyobfuscate.com / Hyperion / Fernet stealers — the
+  `python-deobf-sandbox:latest` image ships pycryptodome + cryptography +
+  requests so decryptor stubs run to completion. Set to `subprocess` only on
+  hosts without Docker (output quality will degrade for AES-encrypted samples).
+- `MOCK_API_JS_SANDBOX=docker|vm|puppeteer` (default `docker`). The JS
+  deobfuscator's sandbox backend. Docker runs untrusted JS inside a `node:18`
+  container with `--network none` for isolation. Set to `vm` to fall back to
+  Node's in-process `vm` module on hosts without Docker; `puppeteer` requires
+  the optional `puppeteer` peer dep in `../js_deobf`.
 
 Uvicorn access logs are disabled by `run.py`; the request middleware logs only
 `request.url.path`, so bearer tokens in SSE query strings are not printed.
@@ -77,18 +88,40 @@ before the first analyze call.
 
 ```bash
 # JS — build dist/ once; subsequent runs reuse the build.
-cd ../js-deobfuscator
+cd ../js_deobf
 npm install
 npm run build
 
 # Python — install Python dependency in the same venv as mock-api.
 pip install rich
+
+# Python sandbox image — required for AES-protected stealer recovery.
+# Build once; py-deobf falls back to ``python:3.12-slim`` with a warning
+# if this image is missing (decryptor stubs will fail to ``import Crypto``).
+docker build -t python-deobf-sandbox:latest \
+    -f ../py_deobf/src/sandbox/docker/Dockerfile.sandbox ../py_deobf
+
+# JS sandbox image — pulled lazily by docker on first run, but pre-pulling
+# avoids a multi-second cold-start on the first analyze call.
+docker pull node:18
 ```
 
-By default the API looks for the backends at `../js-deobfuscator`
-and `../python-deobfuscator` (relative to `mock-api/`). Override with the
+By default the API looks for the backends at `../js_deobf`
+and `../py_deobf` (relative to `mock-api/`). Override with the
 `JS_DEOBF_DIR` / `PY_DEOBF_DIR` environment variables if they live
 somewhere else.
+
+Both backends are always spawned with their docker sandbox by default:
+
+- The Python backend uses ``--sandbox docker`` so that AES-encrypted
+  pyobfuscate.com / Hyperion / Fernet decryptor stubs execute inside the
+  prebuilt ``python-deobf-sandbox:latest`` image (with ``pycryptodome``,
+  ``cryptography`` and ``requests`` preinstalled). Set
+  ``MOCK_API_PY_SANDBOX=subprocess`` to fall back to the host interpreter.
+- The JS backend uses ``--backend docker`` so that untrusted JS runs inside
+  a ``node:18`` container with ``--network none``. Set
+  ``MOCK_API_JS_SANDBOX=vm`` to fall back to Node's in-process ``vm`` module
+  (less safe but does not require Docker).
 
 ## Endpoints
 
