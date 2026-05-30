@@ -26,7 +26,9 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -238,34 +240,65 @@ def _sniff_lang(content: bytes | None) -> str | None:
 ZIP_DEFAULT_PASSWORD = b"infected"
 
 
-def _try_extract_zip(blob: bytes) -> tuple[str, bytes] | None:
-    """If *blob* is a ZIP archive with exactly one file, extract and return
-    ``(inner_filename, inner_bytes)``.  Password-protected archives are
-    tried first without a password, then with the MalwareBazaar default
-    password ``infected``.  Returns ``None`` if *blob* is not a valid ZIP
-    or contains != 1 file.
+def _extract_and_validate_zip(blob: bytes) -> tuple[str, bytes]:
+    """Extract and validate ZIP archive with MalwareBazaar compatibility.
+
+    If the archive is not a valid ZIP, contains other than exactly one file,
+    cannot be decrypted with password 'infected' or has an unsupported extension
+    (other than .js or .py), raises ValueError with a descriptive message.
     """
     if not zipfile.is_zipfile(io.BytesIO(blob)):
-        return None
-    try:
-        zf = zipfile.ZipFile(io.BytesIO(blob))
-    except zipfile.BadZipFile:
-        return None
-    members = [m for m in zf.infolist() if not m.is_dir()]
-    if len(members) != 1:
-        return None
-    member = members[0]
-    for pwd in (None, ZIP_DEFAULT_PASSWORD):
+        raise ValueError("Not a valid ZIP archive.")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        zip_file = tmp_path / "upload.zip"
+        zip_file.write_bytes(blob)
+
+        # Output directory for 7z extraction
+        out_dir = tmp_path / "out"
+        out_dir.mkdir()
+
+        # Run 7z to extract the zip file
+        cmd = ["7z", "e", "-pinfected", f"-o{out_dir}", str(zip_file), "-y"]
         try:
-            data = zf.read(member.filename, pwd=pwd)
-            inner_name = Path(member.filename).name or "extracted.bin"
-            return inner_name, data
-        except RuntimeError:
-            # "Bad password" or "requires password" → try next
-            continue
-        except Exception:
-            return None
-    return None
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        except Exception as e:
+            raise ValueError(f"Failed to execute 7z extraction: {e}")
+
+        if res.returncode != 0:
+            raise ValueError("Could not decrypt ZIP archive. Password 'infected' is expected.")
+
+        # List all extracted files
+        extracted_files = [f for f in out_dir.iterdir() if f.is_file()]
+        if len(extracted_files) != 1:
+            raise ValueError(
+                f"ZIP archive must contain exactly one file. Found {len(extracted_files)} files."
+            )
+
+        extracted_file = extracted_files[0]
+        inner_name = extracted_file.name
+
+        # Check extension (must be .js or .py)
+        suffix = extracted_file.suffix.lower()
+        if suffix not in (".js", ".py"):
+            raise ValueError(
+                f"Rejected: ZIP archive contains an unsupported file type '{suffix}'. "
+                f"Only .js and .py files are accepted."
+            )
+
+        inner_bytes = extracted_file.read_bytes()
+
+        # Zip-bomb protection: check size
+        MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024  # 50 MB
+        if len(inner_bytes) > MAX_UNCOMPRESSED_BYTES:
+            raise ValueError("Extracted file size exceeds the limit of 50 MB.")
+
+        ratio = len(inner_bytes) / max(len(blob), 1)
+        if ratio > 1000:
+            raise ValueError("Potential ZIP bomb detected (compression ratio too high).")
+
+        return inner_name, inner_bytes
 
 
 def detect_lang(filename: str, hint: str | None, content: bytes | None = None) -> str:
@@ -505,10 +538,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -839,8 +869,8 @@ def llm_put_config(
     body: LLMConfigBody,
     user: dict = Depends(auth.current_user),
 ) -> dict:
-    """Write to both ``js-deobfuscator/llm_config.toml`` and
-    ``python-deobfuscator/llm_config.toml`` simultaneously.
+    """Write to both ``js_deobf/llm_config.toml`` and
+    ``py_deobf/llm_config.toml`` simultaneously.
 
     Comments and unknown keys (multi-line prompts, ``rename_prompt``,
     ``format_prompt``) are preserved by ``llm_config.write_config``.
@@ -1144,20 +1174,22 @@ async def analyze(
     safe_name = Path(raw_name).name or "upload.bin"
 
     # ── ZIP handling (MalwareBazaar compatibility) ────────────────────────
-    extracted = _try_extract_zip(blob)
-    if extracted is not None:
-        inner_name, inner_bytes = extracted
-        job_log.info(
-            "zip_extracted %s",
-            kv(
-                outer=safe_name,
-                inner=inner_name,
-                outer_bytes=len(blob),
-                inner_bytes=len(inner_bytes),
-            ),
-        )
-        safe_name = inner_name
-        blob = inner_bytes
+    if zipfile.is_zipfile(io.BytesIO(blob)):
+        try:
+            inner_name, inner_bytes = _extract_and_validate_zip(blob)
+            job_log.info(
+                "zip_extracted %s",
+                kv(
+                    outer=safe_name,
+                    inner=inner_name,
+                    outer_bytes=len(blob),
+                    inner_bytes=len(inner_bytes),
+                ),
+            )
+            safe_name = inner_name
+            blob = inner_bytes
+        except ValueError as exc:
+            raise HTTPException(400, detail=str(exc))
 
     lang = detect_lang(safe_name, lang_hint, content=blob)
     sha256 = hashlib.sha256(blob).hexdigest() if blob else ""
