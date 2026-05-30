@@ -1238,7 +1238,17 @@ async def analyze(
         ),
     )
     asyncio.create_task(run_job(job))
-    return {"job_id": job.id, "lang": lang, "filename": job.filename, "size": job.size}
+    try:
+        uploaded_code = blob.decode("utf-8", errors="replace")
+    except Exception:
+        uploaded_code = ""
+    return {
+        "job_id": job.id,
+        "lang": lang,
+        "filename": job.filename,
+        "size": job.size,
+        "uploaded_code": uploaded_code,
+    }
 
 
 def _load_job_for_user(job_id: str, user_id: int) -> Job | None:
