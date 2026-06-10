@@ -8,12 +8,43 @@ real deobfuscators based on filename detection:
 - **pydeobf** — `.py` / `.pyc` files → `python src/main.py` from
   `../py_deobf`.
 
-The API persists users, tokens and job metadata in a local SQLite file
-(`data.db`) and stores each job's working directory under `runs/<job_id>/`
+The API persists users, tokens and job metadata in **PostgreSQL** through
+the async `asyncpg` driver (see `db.py`); the connection string comes from
+`$DATABASE_URL`. Each job's working directory lives under `runs/<job_id>/`
 (uploaded blob + deobfuscator output). Live SSE buffers and asyncio
 primitives stay in memory; restarting the process drops in-flight jobs
-(they are auto-marked `error` on startup), but completed jobs survive and
-are replayed as a one-shot snapshot.
+(they are auto-marked `error` on startup), but completed jobs survive in
+PostgreSQL and are replayed as a one-shot snapshot.
+
+## Database (PostgreSQL)
+
+User accounts, bearer tokens and job metadata live in PostgreSQL, reached
+through the async `asyncpg` driver (`db.py`). Bring up a local server in
+Docker (matches the project's existing Docker usage):
+
+```bash
+docker run -d --name sitedeobf-pg \
+  -e POSTGRES_USER=sitedeobf -e POSTGRES_PASSWORD=deobf -e POSTGRES_DB=sitedeobf \
+  -p 127.0.0.1:5432:5432 \
+  -v sitedeobf-pgdata:/var/lib/postgresql/data \
+  postgres:16
+```
+
+The API reads its DSN from `DATABASE_URL`, defaulting to the container
+above:
+
+```
+DATABASE_URL=postgresql://sitedeobf:deobf@127.0.0.1:5432/sitedeobf
+```
+
+Export `DATABASE_URL` before launching to point at any other instance.
+Tables are created automatically on startup (`db.init()`) — there is no
+separate migration step. To reset all state, drop and recreate the
+database, or run:
+
+```sql
+TRUNCATE jobs, tokens, llm_key_owner, users RESTART IDENTITY CASCADE;
+```
 
 ## Run
 
@@ -64,8 +95,9 @@ Environment variables:
 - `MOCK_API_LOG_DIR=C:\path\to\logs` to override the log directory.
 - `MOCK_API_BACKEND_IDLE_TIMEOUT_SECONDS=180` kills a backend that stops
   producing output.
-- `MOCK_API_BACKEND_MAX_RUNTIME_SECONDS=600` kills a backend that runs too long
-  even if it keeps printing.
+- `MOCK_API_BACKEND_MAX_RUNTIME_SECONDS=3600` kills a backend that runs too long
+  even if it keeps printing (default `3600`; a high backstop so it never
+  pre-empts the user-chosen per-sandbox `--timeout`).
 - `MOCK_API_PY_SANDBOX=docker|subprocess` (default `docker`). The Python
   deobfuscator's sandbox backend. Docker is required to recover AES-protected
   pyobfuscate.com / Hyperion / Fernet stealers — the
@@ -132,7 +164,7 @@ Both backends are always spawned with their docker sandbox by default:
 | POST   | `/api/auth/login`             |  —   | Exchange email+password for a bearer token.          |
 | POST   | `/api/auth/logout`            |  ✓   | Invalidate the caller's token.                       |
 | GET    | `/api/auth/me`                |  ✓   | Current user (token check).                          |
-| GET    | `/api/sessions`               |  ✓   | Caller's analysis history (from SQLite).             |
+| GET    | `/api/sessions`               |  ✓   | Caller's analysis history (from PostgreSQL).         |
 | POST   | `/api/analyze`                |  ✓   | Upload a file, kick off a job. Returns `job_id`.     |
 | GET    | `/api/jobs/{job_id}`          |  ✓   | Current job snapshot (status, phase, logs, result).  |
 | GET    | `/api/jobs/{job_id}/stream`   |  ✓   | SSE stream of log lines and phases.                  |

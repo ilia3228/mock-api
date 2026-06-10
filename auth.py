@@ -34,9 +34,9 @@ def verify_password(password: str, pw_hash_hex: str, pw_salt_hex: str) -> bool:
 
 # ─── tokens ──────────────────────────────────────────────────────────────────
 
-def issue_token(user_id: int) -> str:
+async def issue_token(user_id: int) -> str:
     token = secrets.token_urlsafe(32)
-    db.insert_token(token, user_id)
+    await db.insert_token(token, user_id)
     return token
 
 
@@ -48,24 +48,24 @@ def _extract_token(authorization: str | None, token_q: str | None) -> str | None
     return (token_q or "").strip() or None
 
 
-def current_user(
+async def current_user(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
 ) -> dict[str, Any]:
     tok = _extract_token(authorization, token)
     if not tok:
         raise HTTPException(401, "missing authorization token")
-    user = db.user_by_token(tok)
+    user = await db.user_by_token(tok)
     if not user:
         raise HTTPException(401, "invalid or expired token")
     return user
 
 
-def current_user_optional(
+async def current_user_optional(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
 ) -> dict[str, Any] | None:
     tok = _extract_token(authorization, token)
     if not tok:
         return None
-    return db.user_by_token(tok)
+    return await db.user_by_token(tok)

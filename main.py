@@ -7,11 +7,12 @@ output back to the frontend over SSE, and assembles a result bundle
 
 Persistence
 -----------
-- Users / tokens / job metadata live in ``data.db`` (SQLite, see ``db.py``).
+- Users / tokens / job metadata live in PostgreSQL via async ``asyncpg``
+  (see ``db.py``); the DSN comes from ``$DATABASE_URL``.
 - Uploaded files and deobfuscator outputs live under ``runs/<job_id>/``.
 - Live SSE state (async events, in-flight log buffer) is held in memory.
-  Restarting the process drops live state; finished jobs survive in SQLite
-  and are restored on demand.
+  Restarting the process drops live state; finished jobs survive in
+  PostgreSQL and are restored on demand.
 """
 
 from __future__ import annotations
@@ -346,11 +347,28 @@ def _backend_log_level(level: str) -> int:
     return logging.DEBUG
 
 
+async def _drain_db_tasks(tasks: list[asyncio.Task[Any]]) -> None:
+    """Await any fire-and-forget job-phase persistence tasks and clear them.
+
+    Phase updates are scheduled from the synchronous ``on_phase`` callback,
+    so they must be drained before writing a terminal (done/error/cancelled)
+    state — otherwise a late phase write could clobber the final status.
+    """
+    if not tasks:
+        return
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for r in results:
+        if isinstance(r, BaseException):
+            job_log.warning("job_phase_persist_failed %s", kv(error=repr(r)))
+    tasks.clear()
+
+
 async def run_job(job: Job) -> None:
     assert job._event is not None and job._cancel is not None
     assert job.input_path is not None, "job.input_path must be set before run_job"
     job.status = "running"
-    db.update_job(job.id, status="running")
+    pending_db: list[asyncio.Task[Any]] = []
+    await db.update_job(job.id, status="running")
 
     input_path = Path(job.input_path)
     out_dir = input_path.parent / "out"
@@ -392,7 +410,9 @@ async def run_job(job: Job) -> None:
             return
         job.phase = ph
         job.progress = max(job.progress, runner.PHASE_PROGRESS.get(ph, job.progress))
-        db.update_job(job.id, phase=ph, progress=job.progress)
+        pending_db.append(
+            asyncio.create_task(db.update_job(job.id, phase=ph, progress=job.progress))
+        )
         job_log.info(
             "job_phase %s",
             kv(job_id=job.id, phase=job.phase, progress=round(job.progress, 3)),
@@ -419,7 +439,8 @@ async def run_job(job: Job) -> None:
 
         if job._cancel.is_set():
             job.status = "cancelled"
-            db.update_job(job.id, status="cancelled", phase=job.phase, progress=job.progress)
+            await _drain_db_tasks(pending_db)
+            await db.update_job(job.id, status="cancelled", phase=job.phase, progress=job.progress)
             job_log.warning(
                 "job_cancelled %s",
                 kv(job_id=job.id, phase=job.phase, progress=round(job.progress, 3)),
@@ -462,7 +483,8 @@ async def run_job(job: Job) -> None:
         job.status = "done"
         job.phase = "ioc"
         job.progress = 1.0
-        db.update_job(job.id, status="done", phase="ioc", progress=1.0, result=job.result)
+        await _drain_db_tasks(pending_db)
+        await db.update_job(job.id, status="done", phase="ioc", progress=1.0, result=job.result)
         job_log.info(
             "job_done %s",
             kv(
@@ -478,12 +500,14 @@ async def run_job(job: Job) -> None:
     except Exception as exc:
         job.status = "error"
         job.error = repr(exc)
-        db.update_job(job.id, status="error", error=job.error)
+        await _drain_db_tasks(pending_db)
+        await db.update_job(job.id, status="error", error=job.error)
         job_log.exception(
             "job_error %s",
             kv(job_id=job.id, lang=job.lang, filename=job.filename, error=repr(exc)),
         )
     finally:
+        await _drain_db_tasks(pending_db)
         if job._event is not None:
             job._event.set()
 
@@ -596,23 +620,23 @@ async def log_requests(request: Request, call_next):  # noqa: ANN001, ANN201
     return response
 
 
-def _adopt_legacy_llm_key_owner() -> None:
-    if db.llm_key_owner_user_id() is not None or not llmcfg.is_configured():
+async def _adopt_legacy_llm_key_owner() -> None:
+    if await db.llm_key_owner_user_id() is not None or not llmcfg.is_configured():
         return
-    only_user_id = db.single_user_id()
+    only_user_id = await db.single_user_id()
     if only_user_id is None:
         llmcfg.clear_verified_fingerprint()
         log.warning("llm_key_unowned_legacy_config")
         return
-    db.set_llm_key_owner(only_user_id)
+    await db.set_llm_key_owner(only_user_id)
     llmcfg.clear_verified_fingerprint()
     log.info("llm_key_legacy_owner_adopted %s", kv(user_id=only_user_id))
 
 
 @app.on_event("startup")
-def _startup() -> None:
-    db.init()
-    _adopt_legacy_llm_key_owner()
+async def _startup() -> None:
+    await db.init()
+    await _adopt_legacy_llm_key_owner()
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     # Diagnostic — confirm that the running event loop is the Proactor
     # variant on Windows so subprocess spawns actually work. Logged once
@@ -629,6 +653,11 @@ def _startup() -> None:
         )
     except RuntimeError:
         log.warning("startup_no_running_loop")
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await db.close()
 
 
 # ─── auth ────────────────────────────────────────────────────────────────────
@@ -652,38 +681,38 @@ def _public_user(u: dict[str, Any]) -> dict[str, Any]:
 
 
 @app.post("/api/auth/signup")
-def signup(body: SignupBody) -> dict[str, Any]:
+async def signup(body: SignupBody) -> dict[str, Any]:
     email = body.email.strip().lower()
     if not EMAIL_RE.match(email):
         raise HTTPException(400, "invalid email")
-    if db.user_by_email(email):
+    if await db.user_by_email(email):
         raise HTTPException(409, "email already registered")
     pw_hash, pw_salt = auth.hash_password(body.password)
-    user = db.insert_user(email=email, name=body.name.strip(), pw_hash=pw_hash, pw_salt=pw_salt)
-    token = auth.issue_token(user["id"])
+    user = await db.insert_user(email=email, name=body.name.strip(), pw_hash=pw_hash, pw_salt=pw_salt)
+    token = await auth.issue_token(user["id"])
     return {"token": token, "user": _public_user(user)}
 
 
 @app.post("/api/auth/login")
-def login(body: LoginBody) -> dict[str, Any]:
+async def login(body: LoginBody) -> dict[str, Any]:
     email = body.email.strip().lower()
-    user = db.user_by_email(email)
+    user = await db.user_by_email(email)
     if not user or not auth.verify_password(body.password, user["pw_hash"], user["pw_salt"]):
         raise HTTPException(401, "invalid email or password")
-    token = auth.issue_token(user["id"])
+    token = await auth.issue_token(user["id"])
     return {"token": token, "user": _public_user(user)}
 
 
 @app.post("/api/auth/logout")
-def logout(
+async def logout(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
     user: dict = Depends(auth.current_user),
 ) -> dict:
     if authorization and authorization.lower().startswith("bearer "):
-        db.delete_token(authorization[7:].strip())
+        await db.delete_token(authorization[7:].strip())
     elif token:
-        db.delete_token(token.strip())
+        await db.delete_token(token.strip())
     return {"ok": True}
 
 
@@ -698,7 +727,7 @@ class ChangePasswordBody(BaseModel):
 
 
 @app.post("/api/auth/change-password")
-def change_password(
+async def change_password(
     body: ChangePasswordBody,
     user: dict = Depends(auth.current_user),
 ) -> dict:
@@ -713,7 +742,7 @@ def change_password(
     ):
         raise HTTPException(401, "current password incorrect")
     pw_hash, pw_salt = auth.hash_password(body.new_password)
-    db.update_user_password(user["id"], pw_hash, pw_salt)
+    await db.update_user_password(user["id"], pw_hash, pw_salt)
     log.info(
         "auth_password_changed %s",
         kv(user_id=user["id"], email=user["email"]),
@@ -722,7 +751,7 @@ def change_password(
 
 
 @app.delete("/api/auth/tokens")
-def auth_delete_tokens(
+async def auth_delete_tokens(
     authorization: str | None = Header(default=None),
     token: str | None = Query(default=None),
     user: dict = Depends(auth.current_user),
@@ -733,7 +762,7 @@ def auth_delete_tokens(
         own_token = authorization[7:].strip() or None
     elif token:
         own_token = token.strip() or None
-    revoked = db.delete_user_tokens(user["id"], except_token=own_token)
+    revoked = await db.delete_user_tokens(user["id"], except_token=own_token)
     log.info(
         "auth_tokens_revoked %s",
         kv(user_id=user["id"], revoked=revoked, kept_own=bool(own_token)),
@@ -746,7 +775,7 @@ class DeleteAccountBody(BaseModel):
 
 
 @app.delete("/api/auth/me")
-def delete_me(
+async def delete_me(
     body: DeleteAccountBody,
     user: dict = Depends(auth.current_user),
 ) -> dict:
@@ -769,17 +798,17 @@ def delete_me(
         JOBS.pop(job.id, None)
 
     # Wipe each per-job directory before we lose the id list.
-    for job_id in db.all_job_ids_for_user(user["id"]):
+    for job_id in await db.all_job_ids_for_user(user["id"]):
         work_dir = RUNS_DIR / job_id
         if work_dir.exists():
             shutil.rmtree(work_dir, ignore_errors=True)
 
-    if _llm_key_owned_by(user):
+    if await _llm_key_owned_by(user):
         llmcfg.write_config({"clear_api_key": True})
-        db.clear_llm_key_owner(int(user["id"]))
+        await db.clear_llm_key_owner(int(user["id"]))
         llmcfg.clear_verified_fingerprint()
 
-    db.delete_user(user["id"])  # CASCADE clears tokens + jobs
+    await db.delete_user(user["id"])  # CASCADE clears tokens + jobs
     log.warning(
         "auth_account_deleted %s",
         kv(user_id=user["id"], email=user["email"], in_flight=len(in_flight)),
@@ -811,20 +840,20 @@ class LLMConfigBody(BaseModel):
     api_key_env:     str | None   = Field(default=None, max_length=128)
 
 
-def _llm_key_owner_id() -> int | None:
-    return db.llm_key_owner_user_id()
+async def _llm_key_owner_id() -> int | None:
+    return await db.llm_key_owner_user_id()
 
 
-def _llm_key_owned_by(user: dict[str, Any]) -> bool:
-    return _llm_key_owner_id() == int(user["id"])
+async def _llm_key_owned_by(user: dict[str, Any]) -> bool:
+    return await _llm_key_owner_id() == int(user["id"])
 
 
-def _llm_configured_for_user(user: dict[str, Any]) -> bool:
-    return _llm_key_owned_by(user) and llmcfg.is_configured()
+async def _llm_configured_for_user(user: dict[str, Any]) -> bool:
+    return await _llm_key_owned_by(user) and llmcfg.is_configured()
 
 
-def _llm_public_view_for_user(cfg: dict[str, Any], user: dict[str, Any]) -> dict:
-    owns_key = _llm_key_owned_by(user)
+async def _llm_public_view_for_user(cfg: dict[str, Any], user: dict[str, Any]) -> dict:
+    owns_key = await _llm_key_owned_by(user)
     effective_cfg = cfg if owns_key else {**cfg, "api_key": ""}
     view = llmcfg.public_view(effective_cfg)
     view["api_key_owned"] = owns_key and bool(view["api_key_present"])
@@ -836,7 +865,7 @@ def _llm_public_view_for_user(cfg: dict[str, Any], user: dict[str, Any]) -> dict
 
 
 @app.get("/api/llm/config")
-def llm_get_config(
+async def llm_get_config(
     reveal: bool = Query(False),
     user: dict = Depends(auth.current_user),
 ) -> dict:
@@ -852,9 +881,9 @@ def llm_get_config(
     other users see the shared test config as if no key were present.
     """
     cfg = llmcfg.read_config()
-    view = _llm_public_view_for_user(cfg, user)
+    view = await _llm_public_view_for_user(cfg, user)
     if reveal:
-        if not _llm_key_owned_by(user) or not str(cfg.get("api_key") or "").strip():
+        if not await _llm_key_owned_by(user) or not str(cfg.get("api_key") or "").strip():
             raise HTTPException(403, "llm api key is not owned by this user")
         view["api_key"] = str(cfg.get("api_key") or "")
         log.info(
@@ -865,7 +894,7 @@ def llm_get_config(
 
 
 @app.put("/api/llm/config")
-def llm_put_config(
+async def llm_put_config(
     body: LLMConfigBody,
     user: dict = Depends(auth.current_user),
 ) -> dict:
@@ -886,7 +915,7 @@ def llm_put_config(
     if "api_key" in payload:
         payload["api_key"] = str(payload["api_key"]).strip()
 
-    owner_id = _llm_key_owner_id()
+    owner_id = await _llm_key_owner_id()
     owns_key = owner_id == int(user["id"])
     key_being_set = "api_key" in payload
     key_being_cleared = bool(payload.get("clear_api_key"))
@@ -901,13 +930,14 @@ def llm_put_config(
 
     llmcfg.write_config(payload)
     if key_being_set:
-        db.set_llm_key_owner(int(user["id"]))
+        await db.set_llm_key_owner(int(user["id"]))
         llmcfg.clear_verified_fingerprint()
     elif key_being_cleared:
-        db.clear_llm_key_owner(int(user["id"]))
+        await db.clear_llm_key_owner(int(user["id"]))
         llmcfg.clear_verified_fingerprint()
     elif not llmcfg.is_configured():
-        db.clear_llm_key_owner(int(user["id"]))
+        await db.clear_llm_key_owner(int(user["id"]))
+    current_owner_id = await _llm_key_owner_id()
     log.info(
         "llm_config_updated %s",
         kv(
@@ -916,10 +946,10 @@ def llm_put_config(
             api_key_changed=key_being_set or key_being_cleared,
             api_key_cleared=key_being_cleared,
             previous_owner_id=owner_id,
-            owner_id=_llm_key_owner_id(),
+            owner_id=current_owner_id,
         ),
     )
-    return _llm_public_view_for_user(llmcfg.read_config(), user)
+    return await _llm_public_view_for_user(llmcfg.read_config(), user)
 
 
 @app.post("/api/llm/check")
@@ -936,7 +966,7 @@ async def llm_check(
     Returns ``{ok, engine, results: [{engine, ok, latency_ms, ...}]}``
     so the frontend can render either one or two rows.
     """
-    if not _llm_configured_for_user(user):
+    if not await _llm_configured_for_user(user):
         raise HTTPException(400, "llm not configured")
 
     cfg = llmcfg.read_config()
@@ -1125,8 +1155,8 @@ def phases() -> list[dict]:
 # ─── protected: sessions + jobs ──────────────────────────────────────────────
 
 @app.get("/api/sessions")
-def sessions(user: dict = Depends(auth.current_user)) -> list[dict]:
-    rows = db.jobs_for_user(user["id"])
+async def sessions(user: dict = Depends(auth.current_user)) -> list[dict]:
+    rows = await db.jobs_for_user(user["id"])
     out = [_session_view(r) for r in rows]
     if out:
         out[0]["active"] = True
@@ -1161,7 +1191,7 @@ async def analyze(
         raise HTTPException(
             400, f"llm_mode must be one of {VALID_LLM_MODES!r}"
         )
-    if llm_mode != "off" and not _llm_configured_for_user(user):
+    if llm_mode != "off" and not await _llm_configured_for_user(user):
         # Frontend treats this as “redirect to Settings → LLM”.
         raise HTTPException(400, "llm not configured")
     if max_layers is not None and max_layers <= 0:
@@ -1220,7 +1250,7 @@ async def analyze(
     job._event = asyncio.Event()
     job._cancel = asyncio.Event()
     JOBS[job.id] = job
-    db.insert_job(
+    await db.insert_job(
         job.id, user["id"], job.filename, job.size, job.lang,
         "queued", options=job.options_dict(),
     )
@@ -1251,14 +1281,14 @@ async def analyze(
     }
 
 
-def _load_job_for_user(job_id: str, user_id: int) -> Job | None:
+async def _load_job_for_user(job_id: str, user_id: int) -> Job | None:
     """Resolve a Job from memory or hydrate a read-only snapshot from DB."""
     job = JOBS.get(job_id)
     if job is not None:
         if job.user_id != user_id:
             return None
         return job
-    row = db.get_job(job_id)
+    row = await db.get_job(job_id)
     if not row or row["user_id"] != user_id:
         return None
     saved_opts = row.get("options") or {}
@@ -1288,8 +1318,8 @@ def _load_job_for_user(job_id: str, user_id: int) -> Job | None:
 
 
 @app.get("/api/jobs/{job_id}")
-def get_job(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
-    job = _load_job_for_user(job_id, user["id"])
+async def get_job(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
+    job = await _load_job_for_user(job_id, user["id"])
     if job is None:
         raise HTTPException(404, f"job {job_id!r} not found")
     return {
@@ -1319,7 +1349,7 @@ def cancel_job(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
 
 
 @app.delete("/api/jobs/{job_id}")
-def delete_job_endpoint(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
+async def delete_job_endpoint(job_id: str, user: dict = Depends(auth.current_user)) -> dict:
     # If the job is still in memory we need to signal cancellation first so
     # the background coroutine winds down cleanly; otherwise it would carry
     # on writing to a DB row we're about to remove.
@@ -1328,7 +1358,7 @@ def delete_job_endpoint(job_id: str, user: dict = Depends(auth.current_user)) ->
         if job._cancel is not None and job.status in ("queued", "running"):
             job._cancel.set()
         JOBS.pop(job_id, None)
-    removed = db.delete_job(job_id, user["id"])
+    removed = await db.delete_job(job_id, user["id"])
     if not removed and job is None:
         raise HTTPException(404, f"job {job_id!r} not found")
     # Best-effort cleanup of the per-job working directory.
@@ -1343,8 +1373,8 @@ def delete_job_endpoint(job_id: str, user: dict = Depends(auth.current_user)) ->
 
 
 @app.get("/api/jobs/{job_id}/clean", response_class=PlainTextResponse)
-def download_clean(job_id: str, user: dict = Depends(auth.current_user)) -> PlainTextResponse:
-    job = _load_job_for_user(job_id, user["id"])
+async def download_clean(job_id: str, user: dict = Depends(auth.current_user)) -> PlainTextResponse:
+    job = await _load_job_for_user(job_id, user["id"])
     if job is None:
         raise HTTPException(404, f"job {job_id!r} not found")
     if job.result is None:
@@ -1366,7 +1396,7 @@ async def stream_job(job_id: str, user: dict = Depends(auth.current_user)) -> St
     job = JOBS.get(job_id)
     if job is None:
         # Finished job — emit a one-shot snapshot+end derived from DB.
-        snap = _load_job_for_user(job_id, user["id"])
+        snap = await _load_job_for_user(job_id, user["id"])
         if snap is None:
             raise HTTPException(404, f"job {job_id!r} not found")
 

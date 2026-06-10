@@ -2,10 +2,6 @@
 __pycache__/
 *.pyc
 .env
-data.db
-data.db-journal
-data.db-wal
-data.db-shm
 llm_verified.json
 llm_verified.json.tmp
 runs/
