@@ -82,7 +82,7 @@ def _float_env(name: str, default: float) -> float:
 
 
 BACKEND_IDLE_TIMEOUT_SECONDS = _float_env("MOCK_API_BACKEND_IDLE_TIMEOUT_SECONDS", 180.0)
-BACKEND_MAX_RUNTIME_SECONDS = _float_env("MOCK_API_BACKEND_MAX_RUNTIME_SECONDS", 60.0)
+BACKEND_MAX_RUNTIME_SECONDS = _float_env("MOCK_API_BACKEND_MAX_RUNTIME_SECONDS", 3600.0)
 BACKEND_STOP_GRACE_SECONDS = _float_env("MOCK_API_BACKEND_STOP_GRACE_SECONDS", 5.0)
 
 # Python deobfuscator sandbox backend. py-deobf's CLI defaults to ``subprocess``,
