@@ -238,6 +238,70 @@ def _sniff_lang(content: bytes | None) -> str | None:
     return None
 
 
+# PyInstaller's CArchive magic cookie ("MEI" + version bytes), found in the
+# executable's overlay regardless of host OS. py-deobf unpacks these.
+_PYINSTALLER_COOKIE = b"MEI\x0c\x0b\x0a\x0b\x0e"
+
+
+def _sniff_binary_lang(content: bytes | None) -> str | None:
+    """Route packed executables / raw bytecode to the Python engine.
+
+    PyInstaller, Nuitka and py2exe droppers — plus bare ``.pyc`` — are all
+    handled (or precisely rejected) by py-deobf; the JS engine cannot touch a
+    native binary.
+    """
+    if not content:
+        return None
+    if content.rfind(_PYINSTALLER_COOKIE) != -1:
+        return "py"
+    window = content[:2_000_000]
+    if b"NUITKA_ONEFILE_PARENT" in window or b"PYTHONSCRIPT" in window:
+        return "py"
+    # Raw .pyc: 4-byte magic followed by "\r\n" at bytes [2:4]. Only trust
+    # this on genuinely binary content — otherwise a text file that merely
+    # starts with two characters and a CRLF (e.g. "//\r\n…") would be
+    # misrouted, since older pyc magics (3.7: b"B\r") are ASCII-printable.
+    if (len(content) >= 4 and content[2:4] == b"\r\n"
+            and _looks_binary(content)):
+        return "py"
+    return None
+
+
+def _looks_binary(blob: bytes | None) -> bool:
+    """True for non-text uploads (executables, .pyc) so we don't render the
+    raw bytes as 'source' in the UI."""
+    if not blob:
+        return False
+    head = blob[:8192]
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+        return False
+    except UnicodeDecodeError:
+        return True
+
+
+def _binary_input_note(name: str, blob: bytes) -> str:
+    """Human-readable stand-in shown in the 'original' pane for binary
+    uploads, instead of a screenful of mojibake."""
+    if blob.rfind(_PYINSTALLER_COOKIE) != -1:
+        kind = "PyInstaller executable"
+    elif b"NUITKA_ONEFILE_PARENT" in blob[:2_000_000]:
+        kind = "Nuitka executable"
+    elif b"PYTHONSCRIPT" in blob[:2_000_000]:
+        kind = "py2exe executable"
+    elif len(blob) >= 4 and blob[2:4] == b"\r\n":
+        kind = "Python bytecode (.pyc)"
+    else:
+        kind = "binary file"
+    return (
+        f"# {name} — {kind} ({len(blob):,} bytes)\n"
+        f"# Binary input is not shown as text; the recovered source "
+        f"appears in the clean pane on the right.\n"
+    )
+
+
 ZIP_DEFAULT_PASSWORD = b"infected"
 
 
@@ -246,7 +310,8 @@ def _extract_and_validate_zip(blob: bytes) -> tuple[str, bytes]:
 
     If the archive is not a valid ZIP, contains other than exactly one file,
     cannot be decrypted with password 'infected' or has an unsupported extension
-    (other than .js or .py), raises ValueError with a descriptive message.
+    (other than .js, .py, .pyc or .exe), raises ValueError with a descriptive
+    message.
     """
     if not zipfile.is_zipfile(io.BytesIO(blob)):
         raise ValueError("Not a valid ZIP archive.")
@@ -280,12 +345,12 @@ def _extract_and_validate_zip(blob: bytes) -> tuple[str, bytes]:
         extracted_file = extracted_files[0]
         inner_name = extracted_file.name
 
-        # Check extension (must be .js or .py)
+        # Check extension (must be .js, .py, .pyc or a PyInstaller .exe)
         suffix = extracted_file.suffix.lower()
-        if suffix not in (".js", ".py"):
+        if suffix not in (".js", ".py", ".pyc", ".exe"):
             raise ValueError(
                 f"Rejected: ZIP archive contains an unsupported file type '{suffix}'. "
-                f"Only .js and .py files are accepted."
+                f"Only .js, .py, .pyc and .exe files are accepted."
             )
 
         inner_bytes = extracted_file.read_bytes()
@@ -311,12 +376,22 @@ def detect_lang(filename: str, hint: str | None, content: bytes | None = None) -
         return "py"
     if lower.endswith((".mjs", ".cjs", ".ts")):
         return "js"
+    # Packed executables / raw bytecode → Python engine, decided by content
+    # so renamed or extension-less droppers are still routed correctly.
+    binary = _sniff_binary_lang(content)
+    if binary is not None:
+        return binary
     # `.js` and "no useful extension" both fall through to content
     # sniffing so a Python sample saved as `pasted.js` still ends up
     # in pydeobf instead of being mis-routed to the JS pipeline.
     sniffed = _sniff_lang(content)
     if sniffed is not None:
         return sniffed
+    # A native executable with no recognised packer still belongs to the
+    # Python engine (the JS engine cannot process a binary, and py-deobf
+    # emits a precise "unsupported / Nuitka / py2exe" message).
+    if lower.endswith((".exe", ".bin", ".dll")):
+        return "py"
     return "js"
 
 
@@ -451,9 +526,16 @@ async def run_job(job: Job) -> None:
             input_bytes = input_path.read_bytes()
         except OSError:
             input_bytes = b""
-        original_code = input_bytes.decode("utf-8", errors="replace") if input_bytes else ""
         sha256 = hashlib.sha256(input_bytes).hexdigest() if input_bytes else ""
-        diff_code = _make_unified_diff(original_code, rr.clean_code, job.filename)
+        if _looks_binary(input_bytes):
+            # Binary upload (PyInstaller exe, .pyc, …): show a short note
+            # instead of mojibake, and skip the line diff (a byte-vs-source
+            # diff is meaningless).
+            original_code = _binary_input_note(job.filename, input_bytes)
+            diff_code = ""
+        else:
+            original_code = input_bytes.decode("utf-8", errors="replace") if input_bytes else ""
+            diff_code = _make_unified_diff(original_code, rr.clean_code, job.filename)
         mitre = runner.derive_mitre(job.lang, iocs)
         duration_ms = int((time.time() - job.created_at) * 1000)
 
@@ -1268,10 +1350,13 @@ async def analyze(
         ),
     )
     asyncio.create_task(run_job(job))
-    try:
-        uploaded_code = blob.decode("utf-8", errors="replace")
-    except Exception:
-        uploaded_code = ""
+    if _looks_binary(blob):
+        uploaded_code = _binary_input_note(safe_name, blob)
+    else:
+        try:
+            uploaded_code = blob.decode("utf-8", errors="replace")
+        except Exception:
+            uploaded_code = ""
     return {
         "job_id": job.id,
         "lang": lang,
@@ -1379,10 +1464,11 @@ async def download_clean(job_id: str, user: dict = Depends(auth.current_user)) -
         raise HTTPException(404, f"job {job_id!r} not found")
     if job.result is None:
         raise HTTPException(409, "job is not finished")
-    clean_code = job.result["clean_code"]
-    base, _, ext = (job.filename or "sample.js").rpartition(".")
-    if not base:
-        base, ext = ext, "js"
+    clean_code = job.result.get("clean_code", "")
+    # The cleaned artifact is always source code, so the download extension
+    # follows the engine (py/js) — not the input's (which may be .pyc/.exe).
+    base = (job.filename or "sample").rsplit(".", 1)[0] or "sample"
+    ext = "py" if job.lang == "py" else "js"
     dl_name = f"{base}.cleaned.{ext}"
     return PlainTextResponse(
         clean_code,
