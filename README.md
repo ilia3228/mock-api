@@ -124,8 +124,16 @@ cd ../js_deobf
 npm install
 npm run build
 
-# Python — install Python dependency in the same venv as mock-api.
+# Python — install Python dependency in py_deobf's own venv (the API
+# launches py_deobf with ../py_deobf/.venv, not mock-api's venv).
 pip install rich
+
+# Nuitka binary support — onefile carving needs pefile + zstandard in the
+# py_deobf venv; the static unpacker (nuitka-static-unpacker) must be cloned
+# next to the project (../nuitka-static-unpacker) or pointed at via
+# NUITKA_UNPACKER_DIR; pycdc on PATH decompiles the bundled .pyc modules.
+#   pip install pefile zstandard capstone xdis    # in ../py_deobf/.venv
+#   git clone https://github.com/DimaReverse/nuitka-static-unpacker ../nuitka-static-unpacker
 
 # Python sandbox image — required for AES-protected stealer recovery.
 # Build once; py-deobf falls back to ``python:3.12-slim`` with a warning
